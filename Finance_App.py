@@ -13,15 +13,26 @@ import pypinyin
 
 class ProjectInfo:
     """项目信息元数据（集中管理所有项目相关信息）"""
-    VERSION = "2.7.0"
-    BUILD_DATE = "2025-05-15"
+    VERSION = "2.13.0"
+    BUILD_DATE = "2025-05-18"
     AUTHOR = "杜玛"
     LICENSE = "MIT"
     COPYRIGHT = "© 永久 杜玛"
     URL = "https://github.com/duma520"
     MAINTAINER_EMAIL = "不提供"
     NAME = "人民币收支管理系统"
-    DESCRIPTION = "人民币收支管理系统"
+    DESCRIPTION = """人民币收支管理系统 - 一款功能完善的个人/家庭财务记账工具
+主要功能：
+• 记录收入、支出、借款、还款等各类财务交易
+• 多用户支持，数据隔离存储
+• 智能分类管理，支持自定义分类
+• 强大的统计分析和报表功能
+• 数据备份与恢复机制
+• 借款还款跟踪管理
+• 拼音首字母快速搜索
+• 自动定期备份数据
+• 操作历史撤销功能
+"""
 
 
     @classmethod
@@ -163,6 +174,17 @@ class FinanceApp(QMainWindow):
             self.update_statistics()
         ])
 
+        # 创建状态栏
+        self.statusBar().showMessage(f"🌈 欢迎使用{ProjectInfo.NAME} {ProjectInfo.VERSION}")
+        # 设置状态栏样式
+        self.statusBar().setStyleSheet("""
+            QStatusBar {
+                background-color: #f0f0f0;
+                color: #333;
+                font-size: 12px;
+            }
+        """)
+
     def init_user_db(self):
         """初始化用户数据库"""
         self.master_conn = sqlite3.connect('finance_master.db')
@@ -176,6 +198,15 @@ class FinanceApp(QMainWindow):
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+
+        # 创建配置表（用于存储最后选择的用户等设置）
+        self.master_cursor.execute('''
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        ''')
+
         self.master_conn.commit()
         
         # 检查是否有默认用户
@@ -196,7 +227,7 @@ class FinanceApp(QMainWindow):
         self.cursor.execute('''
             CREATE TABLE IF NOT EXISTS transactions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                type TEXT NOT NULL,  -- 'income' or 'expense' or 'loan' or 'repayment'
+                type TEXT NOT NULL,  -- 'income' or 'expense' or 'loan' or 'repayment' or 'balance'
                 amount REAL NOT NULL,
                 category TEXT,
                 description TEXT,
@@ -255,7 +286,19 @@ class FinanceApp(QMainWindow):
         
         login_dialog = LoginDialog(self)
         login_dialog.load_users(users)
-        
+
+        # 从主数据库中读取最后选择的用户
+        try:
+            self.master_cursor.execute("SELECT value FROM settings WHERE key='last_user'")
+            last_user = self.master_cursor.fetchone()
+            if last_user and last_user[0] in users:
+                index = login_dialog.user_combo.findText(last_user[0])
+                if index >= 0:
+                    login_dialog.user_combo.setCurrentIndex(index)
+        except sqlite3.OperationalError:
+            # 如果settings表不存在，忽略错误
+            pass
+                    
         if login_dialog.exec_() == QDialog.Accepted:
             username = login_dialog.user_combo.currentText()
             new_user = login_dialog.new_user_edit.text().strip()
@@ -270,12 +313,36 @@ class FinanceApp(QMainWindow):
                     self.master_conn.commit()
                     username = new_user
                 except sqlite3.IntegrityError:
-                    QMessageBox.warning(self, "警告", "用户名已存在!")
+                    self.statusBar().showMessage("❌ 用户名已存在!", 5000) 
                     return self.show_login_dialog()
-            
+
+            # 保存最后选择的用户到主数据库
+            try:
+                self.master_cursor.execute(
+                    "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                    ('last_user', username)
+                )
+                self.master_conn.commit()
+            except sqlite3.OperationalError:
+                # 如果settings表不存在，先创建表
+                self.master_cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS settings (
+                        key TEXT PRIMARY KEY,
+                        value TEXT
+                    )
+                ''')
+                self.master_conn.commit()
+                # 再次尝试保存
+                self.master_cursor.execute(
+                    "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                    ('last_user', username)
+                )
+                self.master_conn.commit()
+        
             self.init_current_user_db(username)
         else:
             sys.exit()
+
 
     def create_menu_bar(self):
         """创建菜单栏"""
@@ -490,7 +557,7 @@ class FinanceApp(QMainWindow):
         
         # 类型选择
         self.type_combo = QComboBox()
-        self.type_combo.addItems(["收入", "支出", "借款", "还款"])
+        self.type_combo.addItems(["收入", "支出", "借款", "还款", "余额"])  # 添加"余额"选项
         form_layout.addWidget(QLabel("类型:"))
         form_layout.addWidget(self.type_combo)
         
@@ -581,6 +648,14 @@ class FinanceApp(QMainWindow):
             self.update_loan_combo()
         else:
             self.loan_combo.setVisible(False)
+        
+        # 如果是余额类型，禁用金额输入
+        if type_text == "余额":
+            self.amount_edit.setEnabled(False)
+            self.amount_edit.clear()
+        else:
+            self.amount_edit.setEnabled(True)
+
 
     def update_loan_combo(self):
         """更新借款选择框"""
@@ -634,41 +709,74 @@ class FinanceApp(QMainWindow):
         amount_text = self.amount_edit.text().strip()
         category = self.category_combo.currentText()
         if not category:
-            QMessageBox.warning(self, "警告", "请选择类别!")
+            self.statusBar().showMessage("❌ 请选择类别!", 5000)
             self.category_combo.setFocus()
             return
         
         date = self.date_edit.date().toString("yyyy-MM-dd")
         description = self.desc_edit.text().strip()
         
-        # 验证输入
+        # 处理余额记录（特殊处理，不需要用户输入金额）
+        if type_text == "余额":
+            # 保存当前状态以便撤销
+            self.save_state_before_change()
+            
+            # 计算截至该日期的余额
+            self.cursor.execute("""
+                SELECT 
+                    SUM(CASE WHEN type='income' THEN amount ELSE 0 END) -
+                    SUM(CASE WHEN type='expense' THEN amount ELSE 0 END) +
+                    SUM(CASE WHEN type='还款' THEN amount ELSE 0 END) -
+                    SUM(CASE WHEN type='借款' THEN amount ELSE 0 END)
+                FROM transactions
+                WHERE date <= ? AND type != 'balance'
+            """, (date,))
+            
+            amount = self.cursor.fetchone()[0] or 0
+            
+            # 添加余额记录
+            self.cursor.execute('''
+                INSERT INTO transactions 
+                (type, amount, category, description, date)
+                VALUES (?, ?, ?, ?, ?)
+            ''', ('balance', amount, "余额统计", f"截至 {date} 的账户余额", date))
+            self.conn.commit()
+            
+            self.statusBar().showMessage(f"✅ 余额记录已添加: {amount:.2f} 元", 5000)
+            
+            # 清空输入并刷新数据
+            self.load_data()
+            self.update_statistics()
+            return
+        
+        # 对于非余额记录，验证金额输入
         if not amount_text:
-            QMessageBox.warning(self, "警告", "请输入金额!")
+            self.statusBar().showMessage("⚠️ 请输入金额!", 5000)
             self.amount_edit.setFocus()
             return
         
         try:
             amount = float(amount_text)
             if amount <= 0:
-                QMessageBox.warning(self, "警告", "金额必须大于0!")
+                self.statusBar().showMessage("❌ 金额必须大于0!", 5000)
                 self.amount_edit.selectAll()
                 self.amount_edit.setFocus()
                 return
         except ValueError:
-            QMessageBox.warning(self, "警告", "金额必须是有效数字!")
+            self.statusBar().showMessage("❌ 金额必须是有效数字!", 5000)
             self.amount_edit.selectAll()
             self.amount_edit.setFocus()
             return
         
         # 日期不能晚于今天
         if self.date_edit.date() > QDate.currentDate():
-            QMessageBox.warning(self, "警告", "日期不能晚于今天!")
+            self.statusBar().showMessage("❌ 日期不能晚于今天!", 5000)
             self.date_edit.setFocus()
             return
         
         # 描述长度限制
         if len(description) > 100:
-            QMessageBox.warning(self, "警告", "描述不能超过100个字符!")
+            self.statusBar().showMessage("❌ 描述不能超过100个字符!", 5000)
             self.desc_edit.selectAll()
             self.desc_edit.setFocus()
             return
@@ -686,13 +794,13 @@ class FinanceApp(QMainWindow):
             ''', ('借款', amount, category, description, date, 'pending'))
             self.conn.commit()
             
-            QMessageBox.information(self, "成功", "借款记录已添加!")
+            self.statusBar().showMessage("✅ 借款记录已添加!", 5000)
         
         elif type_text == "还款":
             # 添加还款记录并关联借款
             loan_id = self.loan_combo.currentData()
             if not loan_id:
-                QMessageBox.warning(self, "警告", "没有可关联的借款!")
+                self.statusBar().showMessage("❌ 没有可关联的借款!", 5000)
                 return
             
             # 添加还款记录
@@ -719,9 +827,9 @@ class FinanceApp(QMainWindow):
                 self.cursor.execute('''
                     UPDATE transactions SET status='settled' WHERE id=?
                 ''', (loan_id,))
-                QMessageBox.information(self, "成功", "借款已全部还清!")
+                self.statusBar().showMessage("✅ 借款已全部还清!", 5000)
             else:
-                QMessageBox.information(self, "成功", "还款记录已添加!")
+                self.statusBar().showMessage("✅ 还款记录已添加!", 5000)
             
             self.conn.commit()
         
@@ -735,7 +843,7 @@ class FinanceApp(QMainWindow):
             ''', (db_type, amount, category, description, date))
             self.conn.commit()
             
-            QMessageBox.information(self, "成功", f"{type_text}记录已添加!")
+            self.statusBar().showMessage(f"✅ {type_text}记录已添加!", 5000)
         
         # 清空输入并刷新数据
         self.amount_edit.clear()
@@ -744,6 +852,7 @@ class FinanceApp(QMainWindow):
         self.update_loan_combo()
         self.update_statistics()
 
+
     def delete_record(self):
         """删除选中的记录(支持多选)"""
         selected_rows = set()
@@ -751,7 +860,7 @@ class FinanceApp(QMainWindow):
             selected_rows.add(item.row())
         
         if not selected_rows:
-            QMessageBox.warning(self, "警告", "请选择要删除的记录!")
+            self.statusBar().showMessage("❌ 请选择要删除的记录!", 5000)
             return
         
         # 收集所有选中的记录ID
@@ -772,10 +881,7 @@ class FinanceApp(QMainWindow):
                 pending_loans.append(str(record_id))
         
         if pending_loans:
-            QMessageBox.warning(
-                self, "警告", 
-                f"不能删除未还清的借款记录(ID: {', '.join(pending_loans)})!"
-            )
+            self.statusBar().showMessage(f"❌ 不能删除未还清的借款记录(ID: {', '.join(pending_loans)})!", 5000)
             return
         
         # 确认删除
@@ -852,7 +958,7 @@ class FinanceApp(QMainWindow):
         """标记记录为已结算"""
         selected = self.table.selectedItems()
         if not selected:
-            QMessageBox.warning(self, "警告", "请选择要结算的记录!")
+            self.statusBar().showMessage("❌ 请选择要结算的记录!", 5000)
             return
         
         row = selected[0].row()
@@ -865,7 +971,7 @@ class FinanceApp(QMainWindow):
         record_type = self.cursor.fetchone()[0]
         
         if record_type != '借款':
-            QMessageBox.warning(self, "警告", "只能结算借款记录!")
+            self.statusBar().showMessage("❌ 只能结算借款记录!", 5000)
             return
         
         # 保存当前状态以便撤销
@@ -877,7 +983,7 @@ class FinanceApp(QMainWindow):
         ''', (record_id,))
         self.conn.commit()
         
-        QMessageBox.information(self, "成功", "借款记录已标记为已结清!")
+        self.statusBar().showMessage("✅ 借款记录已标记为已结清!", 5000)
         self.load_data()
         self.update_loan_combo()
         self.update_statistics()
@@ -998,7 +1104,7 @@ class FinanceApp(QMainWindow):
             query += " WHERE " + " AND ".join(conditions)
         
         # 排序
-        query += " ORDER BY date DESC, id DESC"
+        query += " ORDER BY date ASC, id ASC"
         
         # 执行查询
         self.cursor.execute(query, params)
@@ -1016,17 +1122,21 @@ class FinanceApp(QMainWindow):
                     if value == 'income':
                         item.setText("收入")
                         item.setForeground(Qt.darkGreen)
-                        item.setBackground(MacaronColors.MINT_GREEN)  # 薄荷绿背景
+                        item.setBackground(MacaronColors.MINT_GREEN)
                     elif value == 'expense':
                         item.setText("支出")
                         item.setForeground(Qt.darkRed)
-                        item.setBackground(MacaronColors.ROSE_PINK)   # 玫瑰粉背景
+                        item.setBackground(MacaronColors.ROSE_PINK)
                     elif value == '借款':
                         item.setForeground(Qt.darkBlue)
-                        item.setBackground(MacaronColors.LAVENDER)   # 薰衣草紫背景
+                        item.setBackground(MacaronColors.LAVENDER)
                     elif value == '还款':
                         item.setForeground(Qt.darkMagenta)
-                        item.setBackground(MacaronColors.SKY_BLUE)   # 天空蓝背景
+                        item.setBackground(MacaronColors.SKY_BLUE)
+                    elif value == 'balance':
+                        item.setText("余额")
+                        item.setForeground(Qt.darkYellow)
+                        item.setBackground(MacaronColors.BUTTER_CREAM)  # 使用奶油黄背景
                 
                 # 状态列颜色
                 if col == 6:  # 状态列
@@ -1039,6 +1149,12 @@ class FinanceApp(QMainWindow):
 
                 # 金额列右对齐
                 if col == 2:
+                    try:
+                        # 将金额格式化为保留2位小数
+                        formatted_amount = "{:.2f}".format(float(value))
+                        item.setText(formatted_amount)
+                    except (ValueError, TypeError):
+                        item.setText(str(value))
                     item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 
                 self.table.setItem(row, col, item)
@@ -1099,7 +1215,7 @@ class FinanceApp(QMainWindow):
         <h2>统计时间段: {date_from} 至 {date_to}</h2>
         """
         
-        # 收支总额统计
+        # 在收支总额统计部分修改查询，排除余额记录
         self.cursor.execute("""
             SELECT 
                 SUM(CASE WHEN type='income' THEN amount ELSE 0 END),
@@ -1108,6 +1224,7 @@ class FinanceApp(QMainWindow):
                 SUM(CASE WHEN type='还款' THEN amount ELSE 0 END)
             FROM transactions
             WHERE date BETWEEN ? AND ?
+            AND type != 'balance'  -- 排除余额记录
         """, (date_from, date_to))
         
         total_income, total_expense, total_loans, total_repayments = self.cursor.fetchone()
@@ -1202,7 +1319,7 @@ class FinanceApp(QMainWindow):
                 SELECT id, amount, description, date, status
                 FROM transactions
                 WHERE type='借款' AND date BETWEEN ? AND ?
-                ORDER BY date
+                ORDER BY date ASC
             """, (date_from, date_to))
             
             loans = self.cursor.fetchall()
@@ -1248,6 +1365,14 @@ class FinanceApp(QMainWindow):
 
     def switch_user(self):
         """切换用户"""
+        # 保存当前用户到主数据库
+        if hasattr(self, 'current_user'):
+            self.master_cursor.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                ('last_user', self.current_user)
+            )
+            self.master_conn.commit()
+        
         self.close_current_db()
         self.show_login_dialog()
         
@@ -1259,6 +1384,7 @@ class FinanceApp(QMainWindow):
         self.create_action_buttons()
         self.load_data()
         self.update_statistics()
+
 
     def close_current_db(self):
         """关闭当前用户数据库"""
@@ -1287,9 +1413,9 @@ class FinanceApp(QMainWindow):
         backup_name = f"{backup_dir}/finance_{self.current_user}_manual_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
         try:
             shutil.copy2(f'finance_{self.current_user}.db', backup_name)
-            QMessageBox.information(self, "成功", f"数据已备份为: {backup_name}")
+            self.statusBar().showMessage(f"✅ 数据已备份为: {backup_name}", 5000)
         except Exception as e:
-            QMessageBox.critical(self, "错误", f"备份失败: {str(e)}")
+            self.statusBar().showMessage(f"❌ 备份失败: {str(e)}", 5000)
 
     def set_auto_backup(self):
         """设置自动备份间隔"""
@@ -1306,13 +1432,13 @@ class FinanceApp(QMainWindow):
         
         if ok and interval:
             self.backup_timer.setInterval(intervals[interval])
-            QMessageBox.information(self, "成功", f"已设置为{interval}自动备份")
+            self.statusBar().showMessage(f"✅ 已设置为{interval}自动备份", 5000)
 
     def restore_data(self):
         """恢复数据库"""
         backup_dir = "backups"
         if not os.path.exists(backup_dir):
-            QMessageBox.warning(self, "警告", "备份目录不存在!")
+            self.statusBar().showMessage("⚠️ 备份目录不存在!", 5000)
             return
         
         file_name, _ = QFileDialog.getOpenFileName(
@@ -1334,9 +1460,9 @@ class FinanceApp(QMainWindow):
                     self.cursor = self.conn.cursor()
                     self.load_data()
                     self.update_statistics()
-                    QMessageBox.information(self, "成功", "数据恢复成功!")
+                    self.statusBar().showMessage("✅ 数据恢复成功!", 5000)
                 except Exception as e:
-                    QMessageBox.critical(self, "错误", f"恢复失败: {str(e)}")
+                    self.statusBar().showMessage(f"❌ 恢复失败: {str(e)}", 5000)
                     self.conn = sqlite3.connect(f'finance_{self.current_user}.db')
                     self.cursor = self.conn.cursor()
 
@@ -1354,7 +1480,7 @@ class FinanceApp(QMainWindow):
     def undo_last_operation(self):
         """撤销最后一次操作"""
         if not self.operation_stack:
-            QMessageBox.warning(self, "警告", "没有可撤销的操作!")
+            self.statusBar().showMessage("❌ 没有可撤销的操作!", 5000)
             return
         
         backup_file = self.operation_stack.pop()
@@ -1366,12 +1492,12 @@ class FinanceApp(QMainWindow):
             self.cursor = self.conn.cursor()
             self.load_data()
             self.update_statistics()
-            QMessageBox.information(self, "成功", "已撤销最后一次操作!")
+            self.statusBar().showMessage("✅ 已撤销最后一次操作!", 5000)
             
             # 删除临时文件
             os.remove(backup_file)
         except Exception as e:
-            QMessageBox.critical(self, "错误", f"撤销失败: {str(e)}")
+            self.statusBar().showMessage(f"❌ 撤销失败: {str(e)}", 5000)
             self.conn = sqlite3.connect(f'finance_{self.current_user}.db')
             self.cursor = self.conn.cursor()
 
@@ -1451,13 +1577,13 @@ class FinanceApp(QMainWindow):
                         f"{name} ({'收入' if db_type == 'income' else '支出'})"
                     )
                 except sqlite3.IntegrityError:
-                    QMessageBox.warning(dialog, "警告", "分类已存在!")
+                    self.statusBar().showMessage("⚠️ 分类已存在!", 5000)
 
     def delete_category(self, dialog):
         """删除分类"""
         selected = self.category_list.currentItem()
         if not selected:
-            QMessageBox.warning(dialog, "警告", "请选择要删除的分类!")
+            self.statusBar().showMessage("❌ 请选择要删除的分类!", 5000)
             return
         
         # 提取分类名称
@@ -1472,10 +1598,7 @@ class FinanceApp(QMainWindow):
         count = self.cursor.fetchone()[0]
         
         if count > 0:
-            QMessageBox.warning(
-                dialog, "警告", 
-                f"有{count}条交易记录使用此分类，无法删除!"
-            )
+            self.statusBar().showMessage(f"⚠️ 有{count}条交易记录使用此分类，无法删除!", 5000)
             return
         
         # 确认删除

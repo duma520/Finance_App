@@ -26,7 +26,7 @@ from dateutil.relativedelta import relativedelta
 
 class ProjectInfo:
     """项目信息元数据（集中管理所有项目相关信息）"""
-    VERSION = "4.9"
+    VERSION = "4.8"
     BUILD_DATE = "2025-06-28"
     AUTHOR = "杜玛"
     LICENSE = "MIT"
@@ -68,8 +68,7 @@ class ProjectInfo:
         "4.5": "修复窗口尺寸恢复不了：启动时默认尺寸被写回库、盖掉了上次存的尺寸",
         "4.6": "新增/修改/删除记录后按当前「时间范围」重算并刷新，保证范围内内容持续显示",
         "4.7": "修复「交易附言」被截断：附言改为自由文本清洗（不按逗号切、长度放宽到100字）",
-        "4.8": "搜索筛选栏改为面板+网格对齐（标签右对齐、字段统一宽度），新增「重置」按钮",
-        "4.9": "新增「设置」对话框（工具 → 设置…，点选即保存）：添加记录后自动滚动到列表底部"
+        "4.8": "搜索筛选栏改为面板+网格对齐（标签右对齐、字段统一宽度），新增「重置」按钮"
     }
     HELP_TEXT = """
 基本操作指南：
@@ -81,9 +80,6 @@ class ProjectInfo:
 3. 删除记录：选中记录后点击"删除记录"
 4. 搜索记录：使用搜索框和筛选条件
 5. 统计查看：切换到"统计分析"标签页
-6. 设置：菜单"工具 → 设置…"（★ v4.9）
-   例如开启「添加记录后自动滚动到列表底部」，新增的记录就会立刻出现在视野里；
-   设置项**点选即保存**，不需要点任何保存按钮。
 
 快捷键：
 Ctrl+Z: 撤销操作
@@ -127,8 +123,7 @@ F1: 显示帮助
                 "智能分类与预算控制",
                 "数据加密与备份恢复",
                 "直观的统计图表",
-                "交易提醒信息粘贴自动填写（金额 / 商户或交易附言 / 日期）",
-                "设置（工具 → 设置…，点选即保存）：添加记录后自动滚动到列表底部"
+                "交易提醒信息粘贴自动填写（金额 / 商户或交易附言 / 日期）"
             ]
         }
 
@@ -837,79 +832,6 @@ class LoginDialog(QDialog):
                 self.master_conn.rollback()
 
 
-class SettingsDialog(QDialog):
-    """设置对话框（★ v4.9）
-
-    **点选即保存**：复选框状态一变就立即回调 `on_change(key, value)`（主窗口负责写库），
-    对话框里**没有「保存」按钮**，只有一个「关闭」——和项目「设置实时自动保存」约定一致
-    （见 软件升级迭代记录.md 维护要点 5）。
-
-    以后新增选项：在 `_build_ui` 里加控件 + 用 `self._bind_bool(控件, "键名")` 绑定即可，
-    主窗口只需在 `load_settings` / `save_settings` 里补上同名键。
-    """
-
-    def __init__(self, parent=None, values=None, on_change=None):
-        """
-        :param values: 选项当前值，如 {"scroll_bottom_after_add": False}
-        :param on_change: Callable[[str, bool], None]，选项变化时立即回调
-        """
-        super().__init__(parent)
-        self.setWindowTitle("设置")
-        self.setMinimumWidth(460)
-        self._values = dict(values or {})
-        self._on_change = on_change
-        self._build_ui()
-
-    # ---------- 界面 ----------
-    def _build_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 14, 16, 12)
-        layout.setSpacing(8)
-
-        tip = QLabel("设置项点选后立即生效并保存，无需点击保存按钮。")
-        tip.setStyleSheet("color: #666666;")
-        layout.addWidget(tip)
-
-        group = QGroupBox("添加记录")
-        group_layout = QVBoxLayout(group)
-        group_layout.setSpacing(6)
-
-        self.chk_scroll_bottom = QCheckBox("添加记录后自动滚动到列表底部（方便看到刚添加的资料）")
-        self.chk_scroll_bottom.setToolTip(
-            "开启后，每次添加记录刷新列表时会自动滚到最底部；\n"
-            "关闭时保持列表当前位置。")
-        group_layout.addWidget(self.chk_scroll_bottom)
-
-        layout.addWidget(group)
-        layout.addStretch(1)
-
-        btn_row = QHBoxLayout()
-        btn_row.addStretch(1)
-        self.btn_close = QPushButton("关闭")
-        self.btn_close.setFixedWidth(80)
-        self.btn_close.clicked.connect(self.accept)
-        btn_row.addWidget(self.btn_close)
-        layout.addLayout(btn_row)
-
-        # ★ 先 setChecked 再连信号：避免构造时用默认值误触发一次“变化”
-        self.chk_scroll_bottom.setChecked(
-            bool(self._values.get("scroll_bottom_after_add", False)))
-        self._bind_bool(self.chk_scroll_bottom, "scroll_bottom_after_add")
-
-    def _bind_bool(self, checkbox, key):
-        """复选框 ↔ 设置键（★ v4.9）：一变就写值 + 立刻回调（点选即保存）"""
-        checkbox.toggled.connect(lambda value, k=key: self._emit(k, bool(value)))
-
-    def _emit(self, key, value):
-        self._values[key] = value
-        if self._on_change:
-            self._on_change(key, value)
-
-    def result_values(self):
-        """返回当前所有选项值（供测试/调用方参考）"""
-        return dict(self._values)
-
-
 class FinanceApp(QMainWindow):
     # ============================================================
     # 窗口几何实时持久化相关默认值（★ v4.4 / v4.5）
@@ -921,10 +843,6 @@ class FinanceApp(QMainWindow):
     GEOMETRY_SAVE_DELAY_MS = 800
     _geom_restoring = False
     _geom_save_timer = None
-
-    # 添加记录后是否自动把列表滚到最底部（★ v4.9，可在「工具 → 设置…」里改）
-    # 同样放类级：任何构造阶段（含 __new__ 出来的测试实例）都能安全取到
-    scroll_bottom_after_add = False
 
     def __init__(self):
         super().__init__()
@@ -1633,11 +1551,6 @@ class FinanceApp(QMainWindow):
         recurring_action = QAction("定期交易", self)
         recurring_action.triggered.connect(self.manage_recurring_transactions)
         tools_menu.addAction(recurring_action)
-
-        # 设置（★ v4.9，点选即保存）
-        settings_action = QAction("设置…", self)
-        settings_action.triggered.connect(self.open_settings)
-        tools_menu.addAction(settings_action)
         
         # 帮助菜单
         help_menu = menubar.addMenu("帮助")
@@ -2299,7 +2212,6 @@ class FinanceApp(QMainWindow):
             self.conn.commit()
             self.statusBar().showMessage(f"✅ 待还款合计记录已添加: {total_remaining:.2f} 元", 5000)
             self.load_data()
-            self._scroll_table_to_bottom()      # ★ v4.9 添加后滚到底（设置开启时）
             return
             
         """原来的添加记录方法，现在只是调用弹窗"""
@@ -5032,13 +4944,6 @@ class FinanceApp(QMainWindow):
             result = self.cursor.fetchone()
             geom_maximized = bool(result and result[0] == "1")
 
-            # ★ v4.9 【同样要先读】程序选项：下面 update_date_range() 会调 save_settings()，
-            #   若这里还没读、save_settings 却已经把键写回去，存的值就会被类级默认值盖掉
-            self.cursor.execute("SELECT value FROM settings WHERE key='scroll_bottom_after_add'")
-            result = self.cursor.fetchone()
-            if result:
-                self.scroll_bottom_after_add = (str(result[0]) == "1")
-
             # 加载日期范围配置
             self.cursor.execute("SELECT value FROM settings WHERE key='date_range'")
             result = self.cursor.fetchone()
@@ -5119,10 +5024,6 @@ class FinanceApp(QMainWindow):
             if hasattr(self, 'backup_timer'):
                 settings['backup_interval_hours'] = str(int(self.backup_timer.interval() / 3600000))
 
-            # 程序选项（★ v4.9）：添加记录后是否自动滚到列表底部
-            # 对话框里点选也会立即写同名键，这里是“退出时兵底保存”
-            settings['scroll_bottom_after_add'] = "1" if self.scroll_bottom_after_add else "0"
-
             # 窗口几何与最大化状态
             # ★ v4.5 启动恢复期间（_geom_restoring=True）不写：否则 __init__ 里默认的
             #   resize(1200,800) 会被当成“用户尺寸”写进库，把上次存的尺寸盖掉
@@ -5138,67 +5039,6 @@ class FinanceApp(QMainWindow):
             self.conn.commit()
         except Exception as e:
             print(f"保存设置失败: {str(e)}")
-
-    # ============================================================
-    # 设置对话框（★ v4.9，点选即保存，无需点保存按钮）
-    # ============================================================
-    def set_app_setting(self, key, value):
-        """写一个程序级设置（立即写库，★ v4.9）
-
-        value 统一存字符串（布尔用 '1'/'0'，与项目现有设置键风格一致）。
-        """
-        self.cursor.execute(
-            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
-            (key, str(value))
-        )
-        self.conn.commit()
-
-    def get_app_setting(self, key, default=None):
-        """读一个程序级设置（★ v4.9，缺失/异常时返回 default）"""
-        try:
-            self.cursor.execute("SELECT value FROM settings WHERE key=?", (key,))
-            row = self.cursor.fetchone()
-            return row[0] if row else default
-        except Exception:
-            return default
-
-    def open_settings(self):
-        """打开「设置」对话框（★ v4.9）
-
-        对话框内选项**点选即回调** `_on_setting_changed`（立即应用 + 写库），
-        所以没有「保存」按钮，只有「关闭」。
-        """
-        dialog = SettingsDialog(
-            self,
-            values={"scroll_bottom_after_add": self.scroll_bottom_after_add},
-            on_change=self._on_setting_changed,
-        )
-        dialog.exec_()
-        return dialog
-
-    def _on_setting_changed(self, key, value):
-        """设置项一变就立刻应用 + 写库（★ v4.9，点选即保存）"""
-        if key == "scroll_bottom_after_add":
-            self.scroll_bottom_after_add = bool(value)
-            self.statusBar().showMessage(
-                "设置已保存：添加记录后" + ("自动滚动到列表底部" if value else "保持列表位置"), 4000)
-        self.set_app_setting(key, "1" if value else "0")
-
-    def _scroll_table_to_bottom(self):
-        """添加记录后把列表滚到最底部（★ v4.9，受设置 `scroll_bottom_after_add` 控制）
-
-        新记录通常排在列表末尾，不滚到底部就看不到刚添加的那条。
-        在「添加记录」完成（已 load_data 刷新）后调用。
-        """
-        if not self.scroll_bottom_after_add:
-            return
-        table = getattr(self, "table", None)
-        if table is None:
-            return
-        try:
-            table.scrollToBottom()
-        except Exception:
-            pass
 
     def cleanup_old_temp_files(self, max_age_hours=24):
         """清理超过指定时间的临时文件"""
@@ -6512,7 +6352,6 @@ class FinanceApp(QMainWindow):
             dialog.accept()
             self.statusBar().showMessage(f"✅ 待还款合计记录已添加: {total_remaining:.2f} 元", 5000)
             self.load_data()
-            self._scroll_table_to_bottom()      # ★ v4.9 添加后滚到底（设置开启时）
         else:
             dialog.accept()
             self.add_record_from_dialog(
@@ -6524,7 +6363,6 @@ class FinanceApp(QMainWindow):
                 recurring_end_edit.date().toString("yyyy-MM-dd") if recurring_check.isChecked() else None,
                 loan_combo.currentData() if type_text == "还款" else None
             )
-            self._scroll_table_to_bottom()      # ★ v4.9 添加后滚到底（设置开启时）
 
     def save_last_type(self, type_text):
         """保存最后选择的类型"""

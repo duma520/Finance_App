@@ -10,9 +10,9 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                              QMessageBox, QComboBox, QDateEdit, QTabWidget, QTextEdit,
                              QAction, QFileDialog, QDialog, QFormLayout, QDialogButtonBox,
                              QStackedWidget, QGroupBox, QInputDialog, QListWidget, QCheckBox,
-                             QSpinBox, QFrame, QGridLayout
+                             QSpinBox
                              )
-from PyQt5.QtCore import Qt, QDate, QTimer, QSize, QByteArray, QEvent
+from PyQt5.QtCore import Qt, QDate, QTimer, QSize, QByteArray
 from PyQt5.QtGui import QIcon, QColor, QPixmap, QPainter
 from PyQt5.QtChart import QChart, QChartView, QPieSeries, QBarSeries, QBarSet, QBarCategoryAxis, QValueAxis
 from PyQt5 import QtGui, QtWidgets
@@ -26,7 +26,7 @@ from dateutil.relativedelta import relativedelta
 
 class ProjectInfo:
     """项目信息元数据（集中管理所有项目相关信息）"""
-    VERSION = "4.9"
+    VERSION = "4.1"
     BUILD_DATE = "2025-06-28"
     AUTHOR = "杜玛"
     LICENSE = "MIT"
@@ -52,7 +52,7 @@ class ProjectInfo:
 • 收据图片管理
 • 汇率转换
 • 交易提醒粘贴自动填写：把微信/支付宝/银行的交易提醒粘贴到「添加记录」弹窗，
-  自动提取并填写 交易金额 / 交易商户(描述) / 交易时间（没有商户时用「交易附言」当作描述）
+  自动提取并填写 交易金额 / 交易商户(描述) / 交易时间
 """
 
     VERSION_HISTORY = {
@@ -61,29 +61,17 @@ class ProjectInfo:
         "3.21.0": "增加重命名用户，删除用户",
         "3.22.0": "优化并补充完整 “关于”功能",
         "4.0": "设置实时自动保存与持久化恢复（自动备份/窗口几何）；建立维护文档体系",
-        "4.1": "添加记录支持粘贴交易提醒信息，自动填写金额/商户(描述)/日期",
-        "4.2": "交易提醒解析支持银行App多行格式（标签+空格+值）；无商户时用「交易附言」当作描述",
-        "4.3": "搜索筛选栏改为两行紧凑布局并限制下拉框宽度，不再把窗口撑宽",
-        "4.4": "窗口尺寸/位置/最大化改为实时（防抖）持久化，不必等正常退出",
-        "4.5": "修复窗口尺寸恢复不了：启动时默认尺寸被写回库、盖掉了上次存的尺寸",
-        "4.6": "新增/修改/删除记录后按当前「时间范围」重算并刷新，保证范围内内容持续显示",
-        "4.7": "修复「交易附言」被截断：附言改为自由文本清洗（不按逗号切、长度放宽到100字）",
-        "4.8": "搜索筛选栏改为面板+网格对齐（标签右对齐、字段统一宽度），新增「重置」按钮",
-        "4.9": "新增「设置」对话框（工具 → 设置…，点选即保存）：添加记录后自动滚动到列表底部"
+        "4.1": "添加记录支持粘贴交易提醒信息，自动填写金额/商户(描述)/日期"
     }
     HELP_TEXT = """
 基本操作指南：
 1. 添加记录：点击"添加记录"按钮
    （弹窗内可把微信/支付宝/银行的「交易提醒信息」粘贴到"交易提醒信息"框，
-    会自动把交易金额填到金额、交易商户填到描述、交易时间填到日期，并自动选好收支类型；
-    银行 App 那种没有商户的提醒，会把「交易附言」填到描述）
+    会自动把交易金额填到金额、交易商户填到描述、交易时间填到日期，并自动选好收支类型）
 2. 编辑记录：选中记录后点击"编辑记录"
 3. 删除记录：选中记录后点击"删除记录"
 4. 搜索记录：使用搜索框和筛选条件
 5. 统计查看：切换到"统计分析"标签页
-6. 设置：菜单"工具 → 设置…"（★ v4.9）
-   例如开启「添加记录后自动滚动到列表底部」，新增的记录就会立刻出现在视野里；
-   设置项**点选即保存**，不需要点任何保存按钮。
 
 快捷键：
 Ctrl+Z: 撤销操作
@@ -127,8 +115,7 @@ F1: 显示帮助
                 "智能分类与预算控制",
                 "数据加密与备份恢复",
                 "直观的统计图表",
-                "交易提醒信息粘贴自动填写（金额 / 商户或交易附言 / 日期）",
-                "设置（工具 → 设置…，点选即保存）：添加记录后自动滚动到列表底部"
+                "交易提醒信息粘贴自动填写（金额/商户/日期）"
             ]
         }
 
@@ -162,24 +149,6 @@ class MacaronColors:
 
 
 # ============================================================
-# 搜索/筛选栏样式与尺寸（★ v4.8）
-# 目的是把筛选区做成「一块整齐的面板」：
-#   · 所有筛选控件放进浅色圆角面板（QFrame#filterPanel），视觉上不再散落；
-#   · 标签统一右对齐 + 字段统一固定宽度，上下两行左右边界对齐。
-# 注意：面板样式只设面板自身（不用后代选择器），避免影响下拉框/日期框的原生外观。
-# ============================================================
-
-FILTER_FIELD_WIDTH = 118        # 下拉框 / 日期框统一宽度（118 ≈ 下拉框原生最小宽度，信息不挤）
-FILTER_PANEL_STYLE = """
-QFrame#filterPanel {
-    background-color: #f6f8fa;
-    border: 1px solid #e1e5ea;
-    border-radius: 6px;
-}
-"""
-
-
-# ============================================================
 # 交易提醒信息解析（★ v4.1 新增）
 # 解析银行公众号 / 微信 / 支付宝 等收到的「交易提醒」文本，
 # 提取 交易金额 / 交易商户 / 交易时间 / 收支方向，
@@ -198,12 +167,6 @@ NOTICE_MERCHANT_LABELS = (
     "交易商户名称", "交易商户", "商户名称", "特约商户", "收单商户", "收款商户",
     "商户名", "收款单位", "收款方", "对方户名", "对方名称", "交易对方名称",
     "交易对方", "付款方名称", "付款方", "商家名称", "商家", "店铺名称", "店铺", "商户",
-)
-
-# 交易附言/摘要/备注标签（银行 App 多行提醒常见，★ v4.2：没有商户时用它当描述）
-NOTICE_MEMO_LABELS = (
-    "交易附言", "附言", "交易摘要", "摘要", "交易备注", "备注", "交易说明",
-    "用途", "说明", "订单标题",
 )
 
 # 时间标签（暂未强制依赖，日期整体扫描已足够）
@@ -388,35 +351,20 @@ def _notice_clean_merchant(raw):
     return s
 
 
-def _notice_labelled_value(text, labels, max_len=60, cleaner=None):
-    """按标签列表（长标签优先）取「标签 + 值」的值 → 清洗后的字符串 或 None
-
-    兼容「标签：值」「标签 值」「标签为值」等写法（银行 App 多行提醒常用大量空格）。
-    cleaner 默认为商户清洗器；附言/摘要这种自由文本传 `_notice_clean_memo`。
-    """
-    if not text:
-        return None
-    clean = cleaner or _notice_clean_merchant
-    for label in labels:
-        for lm in re.finditer(re.escape(label), text):
-            tail = text[lm.end(): lm.end() + max_len]
-            m = re.match(r"\s*[:：\-—>＞]?\s*([^\n]{1,%d})" % max_len, tail)
-            if not m:
-                continue
-            val = clean(m.group(1))
-            if val:
-                return val
-    return None
-
-
 def notice_parse_merchant(text):
     """从交易提醒文本提取交易商户，识别不到返回 None"""
     if not text:
         return None
     # ① 标签（商户名称/交易商户/收款方/对方户名…）
-    val = _notice_labelled_value(text, NOTICE_MERCHANT_LABELS)
-    if val:
-        return val
+    for label in NOTICE_MERCHANT_LABELS:
+        for lm in re.finditer(re.escape(label), text):
+            tail = text[lm.end(): lm.end() + 60]
+            m = re.match(r"\s*[:：\-—>＞]?\s*([^\n]{1,60})", tail)
+            if not m:
+                continue
+            val = _notice_clean_merchant(m.group(1))
+            if val:
+                return val
     # ② 句式兜底（向xxx付款 / 支付给xxx / 支付宝-xxx）
     for pat in (
         r"(?:向|在)\s*([^\s，,。;；、\n]{2,30}?)\s*(?:付款|消费|支付|购物|转账|买单)",
@@ -428,58 +376,6 @@ def notice_parse_merchant(text):
             if val:
                 return val
     return None
-
-
-def _notice_clean_memo(raw):
-    """清洗「交易附言/摘要/备注」→ 纯文本 或 None（★ v4.7）
-
-    与商户的区别（★ 用户反馈：附言被截断，只顾了前半段）：
-    - **不按逗号/分号/顿号等标点切分** —— 附言是自由文本，
-      例：`银联无卡转账,对手户名-李红玲` 必须整条保留（旧的商户清洗器会在逗号处截成 `银联无卡转账`）；
-    - 长度上限放宽到 100 字（旧实现 30 字就砍，长附言会“缺后面一段”）；
-    - 只保留到行尾，并把同一行里误吞进来的**复合字段名**（交易金额/账户余额/交易时间…）切掉；
-      不再用「金额/余额/时间/日期」这类短词去切，以免误伤自由文本。
-    """
-    if not raw:
-        return None
-    s = str(raw).strip()
-    if "\n" in s or "\r" in s:
-        s = s.splitlines()[0].strip()
-    # 只在「字段名前面是空格/分隔符」时才切（看起来像另一个字段的开头）；
-    # 像「…李红玲备注ABC」这种把关键词写进正文的情况不动它
-    for w in ("交易金额", "账户余额", "交易时间", "交易日期", "付款方式",
-              "订单号", "流水号", "交易摘要", "交易备注", "交易说明", "摘要", "备注"):
-        for km in re.finditer(re.escape(w), s):
-            if km.start() <= 1:
-                continue
-            if s[km.start() - 1] in " \t:：,，;；、|":
-                s = s[:km.start()].rstrip(" \t:：,，;；、|")
-                break
-        else:
-            continue
-        break
-    s = s.strip().strip(" 　:：-—>＞=为是 ")
-    s = s.strip(" 　\u300c\u300d\u300e\u300f\u201c\u201d\"'")
-    for lb, rb in (("（", "）"), ("(", ")"), ("【", "】"), ("[", "]"), ("《", "》")):
-        if s.startswith(lb) and s.endswith(rb):
-            s = s[1:-1].strip()
-    if not s:
-        return None
-    if len(s) > 100:
-        s = s[:100].strip()
-    if re.fullmatch(r"[\d\s\.,:：\-/+]+", s):     # 纯数字/符号不是描述
-        return None
-    return s
-
-
-def notice_parse_memo(text):
-    """提取「交易附言/摘要/备注」（★ v4.2）：银行提醒没有商户时用作描述
-
-    例：交易附言    存银行-DCEP010144081682 → "存银行-DCEP010144081682"
-    附言属于**自由文本**，走 `_notice_clean_memo`（不按逗号等标点截断，★ v4.7）。
-    """
-    return _notice_labelled_value(text, NOTICE_MEMO_LABELS, max_len=120,
-                                  cleaner=_notice_clean_memo)
 
 
 def _notice_find_time(s):
@@ -597,17 +493,14 @@ def notice_parse_type(text):
 
 
 def parse_transaction_notice(text, now=None):
-    """解析交易提醒文本 → dict(amount, merchant, memo, datetime, date, type)"""
+    """解析交易提醒文本 → dict(amount, merchant, datetime, date, type)"""
     text = (text or "").strip()
-    empty = {"amount": None, "merchant": None, "memo": None,
-             "datetime": None, "date": None, "type": None}
     if not text:
-        return empty
+        return {"amount": None, "merchant": None, "datetime": None, "date": None, "type": None}
     dt = notice_parse_datetime(text, now=now)
     return {
         "amount": notice_parse_amount(text),
         "merchant": notice_parse_merchant(text),
-        "memo": notice_parse_memo(text),
         "datetime": dt,
         "date": dt.strftime("%Y-%m-%d") if dt else None,
         "type": notice_parse_type(text),
@@ -639,13 +532,10 @@ def apply_transaction_notice(info, type_combo, amount_edit, desc_edit, date_edit
         else:
             skipped.append("金额(当前类型不可编辑)")
 
-    # 描述 = 交易商户；没有商户时退回「交易附言/摘要/备注」（★ v4.2）
+    # 描述 = 交易商户
     if info.get("merchant"):
         desc_edit.setText(info["merchant"])
         filled.append("描述=" + info["merchant"])
-    elif info.get("memo"):
-        desc_edit.setText(info["memo"])
-        filled.append("描述=" + info["memo"] + "（交易附言）")
 
     # 日期 = 交易时间
     if info.get("datetime"):
@@ -837,95 +727,7 @@ class LoginDialog(QDialog):
                 self.master_conn.rollback()
 
 
-class SettingsDialog(QDialog):
-    """设置对话框（★ v4.9）
-
-    **点选即保存**：复选框状态一变就立即回调 `on_change(key, value)`（主窗口负责写库），
-    对话框里**没有「保存」按钮**，只有一个「关闭」——和项目「设置实时自动保存」约定一致
-    （见 软件升级迭代记录.md 维护要点 5）。
-
-    以后新增选项：在 `_build_ui` 里加控件 + 用 `self._bind_bool(控件, "键名")` 绑定即可，
-    主窗口只需在 `load_settings` / `save_settings` 里补上同名键。
-    """
-
-    def __init__(self, parent=None, values=None, on_change=None):
-        """
-        :param values: 选项当前值，如 {"scroll_bottom_after_add": False}
-        :param on_change: Callable[[str, bool], None]，选项变化时立即回调
-        """
-        super().__init__(parent)
-        self.setWindowTitle("设置")
-        self.setMinimumWidth(460)
-        self._values = dict(values or {})
-        self._on_change = on_change
-        self._build_ui()
-
-    # ---------- 界面 ----------
-    def _build_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 14, 16, 12)
-        layout.setSpacing(8)
-
-        tip = QLabel("设置项点选后立即生效并保存，无需点击保存按钮。")
-        tip.setStyleSheet("color: #666666;")
-        layout.addWidget(tip)
-
-        group = QGroupBox("添加记录")
-        group_layout = QVBoxLayout(group)
-        group_layout.setSpacing(6)
-
-        self.chk_scroll_bottom = QCheckBox("添加记录后自动滚动到列表底部（方便看到刚添加的资料）")
-        self.chk_scroll_bottom.setToolTip(
-            "开启后，每次添加记录刷新列表时会自动滚到最底部；\n"
-            "关闭时保持列表当前位置。")
-        group_layout.addWidget(self.chk_scroll_bottom)
-
-        layout.addWidget(group)
-        layout.addStretch(1)
-
-        btn_row = QHBoxLayout()
-        btn_row.addStretch(1)
-        self.btn_close = QPushButton("关闭")
-        self.btn_close.setFixedWidth(80)
-        self.btn_close.clicked.connect(self.accept)
-        btn_row.addWidget(self.btn_close)
-        layout.addLayout(btn_row)
-
-        # ★ 先 setChecked 再连信号：避免构造时用默认值误触发一次“变化”
-        self.chk_scroll_bottom.setChecked(
-            bool(self._values.get("scroll_bottom_after_add", False)))
-        self._bind_bool(self.chk_scroll_bottom, "scroll_bottom_after_add")
-
-    def _bind_bool(self, checkbox, key):
-        """复选框 ↔ 设置键（★ v4.9）：一变就写值 + 立刻回调（点选即保存）"""
-        checkbox.toggled.connect(lambda value, k=key: self._emit(k, bool(value)))
-
-    def _emit(self, key, value):
-        self._values[key] = value
-        if self._on_change:
-            self._on_change(key, value)
-
-    def result_values(self):
-        """返回当前所有选项值（供测试/调用方参考）"""
-        return dict(self._values)
-
-
 class FinanceApp(QMainWindow):
-    # ============================================================
-    # 窗口几何实时持久化相关默认值（★ v4.4 / v4.5）
-    # 放在**类级**：sip 对象上 getattr 一个不存在的属性会抛
-    # RuntimeError("super-class __init__() ... was never called")，
-    # 而不是返回默认值（曾导致 save_settings 直接失败、什么都不写）；
-    # 类级默认值让任何构造阶段（包括 __new__ 出来的测试实例）都能安全取到。
-    # ============================================================
-    GEOMETRY_SAVE_DELAY_MS = 800
-    _geom_restoring = False
-    _geom_save_timer = None
-
-    # 添加记录后是否自动把列表滚到最底部（★ v4.9，可在「工具 → 设置…」里改）
-    # 同样放类级：任何构造阶段（含 __new__ 出来的测试实例）都能安全取到
-    scroll_bottom_after_add = False
-
     def __init__(self):
         super().__init__()
         self.last_selections = {
@@ -981,10 +783,6 @@ class FinanceApp(QMainWindow):
         self.main_layout = QVBoxLayout()
         self.main_widget.setLayout(self.main_layout)
 
-        # 窗口几何实时保存（★ v4.4）：恢复期间先不写盘，避免把默认尺寸盖掉已存的值
-        self._geom_restoring = True
-        self._geom_save_timer = None
-
         # 创建UI组件（不调用reset_ui()）
         # self.create_search_bar()
         # self.create_tabs()
@@ -1005,9 +803,6 @@ class FinanceApp(QMainWindow):
         
         # 现在可以安全加载设置
         self.load_settings()
-
-        # 窗口几何实时保存（★ v4.4）：恢复完成后再启用监听
-        self._init_geometry_autosave()
 
         # 加载数据
         self.load_data()
@@ -1633,11 +1428,6 @@ class FinanceApp(QMainWindow):
         recurring_action = QAction("定期交易", self)
         recurring_action.triggered.connect(self.manage_recurring_transactions)
         tools_menu.addAction(recurring_action)
-
-        # 设置（★ v4.9，点选即保存）
-        settings_action = QAction("设置…", self)
-        settings_action.triggered.connect(self.open_settings)
-        tools_menu.addAction(settings_action)
         
         # 帮助菜单
         help_menu = menubar.addMenu("帮助")
@@ -1721,132 +1511,71 @@ class FinanceApp(QMainWindow):
         self.balance_timer.start(60000)  # 每分钟更新一次
 
     def create_search_bar(self):
-        """创建搜索/筛选面板
-
-        ★ v4.3 布局优化：原来 7 个筛选控件 + 搜索框挤在一行，下拉框按内容自适应宽度
-        （分类/账户名一长就把窗口撑到 1400+ px），现改为「搜索框独占一行 + 筛选两行」，
-        并给筛选下拉框限制最小/最大宽度，长名称自动省略（鼠标悬停看全、下拉里也是全的）。
-
-        ★ v4.8 排版优化（解决“有点凌乱”）：
-          · 整块筛选控件收进浅色圆角面板 `QFrame#filterPanel`，边界清楚、不再散落；
-          · 筛选两行放进**同一个 QGridLayout**：按「标签列 + 字段列」× 4 组排列，
-            标签统一右对齐、下拉框与日期框统一固定宽度 → 上下两行左右边界完全对齐
-            （时间范围/从/到 正好落在 类型/分类/账户 三列下方）；
-          · 搜索行右侧新增「重置」按钮，一键把搜索与筛选恢复默认。
-        """
+        """创建搜索栏"""
+        search_layout = QHBoxLayout()
+        
         # 确保表格已创建
         if self.table is None:
             self.create_data_table()
-
-        # 面板容器：浅色圆角背景，把筛选控件聚成一块（★ v4.8）
-        panel = QFrame()
-        panel.setObjectName("filterPanel")
-        panel.setAttribute(Qt.WA_StyledBackground, True)
-        panel.setStyleSheet(FILTER_PANEL_STYLE)
-        self.filter_panel = panel
-
-        search_box = QVBoxLayout(panel)
-        search_box.setContentsMargins(10, 8, 10, 8)
-        search_box.setSpacing(6)
-
-        def _lab(text):
-            """筛选标签：统一右对齐，让文字紧贴右侧控件，形成整齐的标签列（★ v4.8）"""
-            lb = QLabel(text)
-            lb.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            return lb
-
-        def _compact(combo, min_chars=4):
-            """筛选下拉框：固定宽度 + 内容超过就省略，避免把主窗口撑宽；
-            长名称被省略时用 tooltip 显示全称（下拉列表里也是完整的）。"""
-            combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
-            combo.setMinimumContentsLength(min_chars)
-            combo.setFixedWidth(FILTER_FIELD_WIDTH)
-            combo.setToolTip(combo.currentText())
-            combo.currentIndexChanged.connect(lambda _i, c=combo: c.setToolTip(c.currentText()))
-            return combo
-
-        # ---- 第一行：搜索框（自动拉伸）+ 重置按钮 ----
-        row_search = QHBoxLayout()
-        row_search.setSpacing(6)
-
+    
+        # 搜索框
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("搜索描述、金额或分类...")
-        self.search_edit.setClearButtonEnabled(True)
         self.search_edit.textChanged.connect(self.apply_filters)
-        row_search.addWidget(self.search_edit, 1)
-
-        self.btn_reset_filters = QPushButton("重置")
-        self.btn_reset_filters.setToolTip("清空搜索并恢复所有筛选（时间范围回到「全部时间」）")
-        self.btn_reset_filters.setFixedWidth(64)
-        self.btn_reset_filters.clicked.connect(self.reset_filters)
-        row_search.addWidget(self.btn_reset_filters)
-
-        search_box.addLayout(row_search)
-
-        # ---- 第二/三行：4 组「标签 + 字段」放进同一网格，两行左右对齐（★ v4.8） ----
-        grid = QGridLayout()
-        grid.setContentsMargins(0, 0, 0, 0)
-        grid.setHorizontalSpacing(6)
-        grid.setVerticalSpacing(6)
-
-        # 第 1 组：类型
+        search_layout.addWidget(self.search_edit)
+        
+        # 类型筛选
         self.filter_type_combo = QComboBox()
         self.filter_type_combo.addItems(["所有类型", "收入", "支出", "借款", "还款"])
         self.filter_type_combo.currentIndexChanged.connect(self.apply_filters)
-        grid.addWidget(_lab("类型:"), 0, 0)
-        grid.addWidget(_compact(self.filter_type_combo), 0, 1)
-
-        # 第 2 组：分类
+        search_layout.addWidget(QLabel("类型:"))
+        search_layout.addWidget(self.filter_type_combo)
+        
+        # 分类筛选
         self.filter_category_combo = QComboBox()
         self.filter_category_combo.addItem("所有分类")
         self.filter_category_combo.currentIndexChanged.connect(self.apply_filters)
-        grid.addWidget(_lab("分类:"), 0, 2)
-        grid.addWidget(_compact(self.filter_category_combo), 0, 3)
-
-        # 第 3 组：账户
+        search_layout.addWidget(QLabel("分类:"))
+        search_layout.addWidget(self.filter_category_combo)
+        
+        # 账户筛选
         self.filter_account_combo = QComboBox()
         self.filter_account_combo.addItem("所有账户")
         self.filter_account_combo.currentIndexChanged.connect(self.apply_filters)
-        grid.addWidget(_lab("账户:"), 0, 4)
-        grid.addWidget(_compact(self.filter_account_combo), 0, 5)
-
-        # 第 4 组：状态
+        search_layout.addWidget(QLabel("账户:"))
+        search_layout.addWidget(self.filter_account_combo)
+        
+        # 状态筛选
         self.filter_status_combo = QComboBox()
         self.filter_status_combo.addItems(["所有状态", "待还款", "已结清"])
         self.filter_status_combo.currentIndexChanged.connect(self.apply_filters)
-        grid.addWidget(_lab("状态:"), 0, 6)
-        grid.addWidget(_compact(self.filter_status_combo), 0, 7)
+        search_layout.addWidget(QLabel("状态:"))
+        search_layout.addWidget(self.filter_status_combo)
 
-        # 第 1 组下方：时间范围
+        # 日期范围选择
         self.date_range_combo = QComboBox()
         self.date_range_combo.addItems(["全部时间", "最近一周", "最近一月", "最近一年", "自定义"])
         self.date_range_combo.currentIndexChanged.connect(self.update_date_range)
-        grid.addWidget(_lab("时间范围:"), 1, 0)
-        grid.addWidget(_compact(self.date_range_combo), 1, 1)
+        search_layout.addWidget(QLabel("时间范围:"))
+        search_layout.addWidget(self.date_range_combo)
 
-        # 第 2 组下方：从
+        # 日期范围
         self.date_from_edit = QDateEdit()
         self.date_from_edit.setDate(QDate.currentDate().addMonths(-1))
         self.date_from_edit.setCalendarPopup(True)
-        self.date_from_edit.setFixedWidth(FILTER_FIELD_WIDTH)
         self.date_from_edit.dateChanged.connect(self.apply_filters)
-        grid.addWidget(_lab("从:"), 1, 2)
-        grid.addWidget(self.date_from_edit, 1, 3)
-
-        # 第 3 组下方：到
+        search_layout.addWidget(QLabel("从:"))
+        search_layout.addWidget(self.date_from_edit)
+        
         self.date_to_edit = QDateEdit()
         self.date_to_edit.setDate(QDate.currentDate())
         self.date_to_edit.setCalendarPopup(True)
-        self.date_to_edit.setFixedWidth(FILTER_FIELD_WIDTH)
         self.date_to_edit.dateChanged.connect(self.apply_filters)
-        grid.addWidget(_lab("到:"), 1, 4)
-        grid.addWidget(self.date_to_edit, 1, 5)
-
-        grid.setColumnStretch(8, 1)          # 右侧留白，整块控件左对齐
-        search_box.addLayout(grid)
-
-        self.main_layout.addWidget(panel)
-
+        search_layout.addWidget(QLabel("到:"))
+        search_layout.addWidget(self.date_to_edit)
+        
+        self.main_layout.addLayout(search_layout)
+        
         # 加载配置
         self.load_settings()
         
@@ -1855,28 +1584,6 @@ class FinanceApp(QMainWindow):
         
         # 加载账户数据
         self.load_accounts()
-
-    def reset_filters(self):
-        """重置搜索与筛选条件（★ v4.8）
-
-        清空搜索框 → 四个筛选下拉框回到第一项 → 时间范围回到「全部时间」并重算起止，
-        最后统一走 `load_data()` 刷新（数据变动一律走 load_data，见维护要点）。
-        设置期间用 blockSignals 屏蔽信号，避免连续刷新多次。
-        """
-        self.search_edit.clear()
-
-        for combo in (self.filter_type_combo, self.filter_category_combo,
-                      self.filter_account_combo, self.filter_status_combo):
-            combo.blockSignals(True)
-            combo.setCurrentIndex(0)
-            combo.blockSignals(False)
-
-        self.date_range_combo.blockSignals(True)
-        self.date_range_combo.setCurrentIndex(0)
-        self.date_range_combo.blockSignals(False)
-
-        self.update_date_range(0)      # 全部时间 → 起止取库里 MIN/MAX（末尾会 save_settings）
-        self.load_data()               # 统一刷新
 
     def load_categories(self):
         """加载分类数据到筛选框"""
@@ -2299,7 +2006,6 @@ class FinanceApp(QMainWindow):
             self.conn.commit()
             self.statusBar().showMessage(f"✅ 待还款合计记录已添加: {total_remaining:.2f} 元", 5000)
             self.load_data()
-            self._scroll_table_to_bottom()      # ★ v4.9 添加后滚到底（设置开启时）
             return
             
         """原来的添加记录方法，现在只是调用弹窗"""
@@ -3064,14 +2770,9 @@ class FinanceApp(QMainWindow):
         return "".join(abbr)
 
     def load_data(self):
-        """加载数据（★ v4.6：先按当前「时间范围」重算起止日期，再刷新列表）"""
+        """加载数据"""
         if not hasattr(self, 'table') or self.table is None:
             self.create_data_table()
-
-        # ★ v4.6 先重算时间范围：让「最近一周/一月/一年」始终锚定今天，
-        # 新增记录（默认日期=今天）不会因为旧的「到」而看不到；「自定义」不受影响。
-        # 这里统一处理，增/改/删/撤销/恢复/初始化等所有刷新入口都自动生效。
-        self._recalc_date_range()
 
         # 更新所有借款状态
         self.cursor.execute("SELECT id FROM transactions WHERE type='借款'")
@@ -4981,64 +4682,13 @@ class FinanceApp(QMainWindow):
         # 保存配置
         self.save_settings()
 
-    def _recalc_date_range(self):
-        """按当前「时间范围」重算起止日期（★ v4.6，内部用）
-
-        为什么需要：起止日期是「选择那一刻」算出来的（最近一周 = 当天-7 ~ 当天）。
-        - 程序开着过了一夜/几天后再新增记录（默认日期是“今天”），新记录的日期会超出
-          旧的「到」，结果就是「加了记录但列表里看不到」；
-        - 选「全部时间」时起止是按当时库里的 MIN/MAX 算的，新增更晚的记录同样落在旧的
-          「到」之外（虽然“全部时间”不参与过滤，但控件值会不一致）；
-        - 选「自定义」时**不动**用户设的日期（只刷新表），用户自己选的范围要保留。
-        由 load_data() 在每个刷新入口（增/改/删/撤销/恢复/初始化…）自动调用。
-        """
-        combo = self.__dict__.get('date_range_combo')
-        if combo is None:
-            return
-        # 重算过程中先屏蔽 dateChanged，避免每设一个日期就刷一次表
-        edits = [w for w in (self.__dict__.get('date_from_edit'),
-                             self.__dict__.get('date_to_edit')) if w is not None]
-        blocked = [(w, w.blockSignals(True)) for w in edits]
-        try:
-            self.update_date_range(combo.currentIndex())
-        except Exception as e:
-            print(f"重算时间范围失败: {str(e)}")
-        finally:
-            for w, old in blocked:
-                w.blockSignals(old)
-
     def load_settings(self):
         """加载配置（从当前用户库 settings 表恢复所有持久化设置）"""
         try:
             # 首先检查必要的下拉框是否已初始化
             if not hasattr(self, 'type_combo') or self.type_combo is None:
                 return
-
-            # ★ v4.5 【关键】先把窗口几何/最大化状态读出来再干别的！
-            # 原因：下面的 update_date_range() 会调用 save_settings()，而那时窗口还是
-            # 默认尺寸（__init__ 里的 resize(1200,800)），会把默认尺寸写进 settings；
-            # 若“恢复”步骤放在最后才去读库，读到的就是刚刚被写进去的默认尺寸 ——
-            # 结果就是窗口尺寸永远恢复不了（用户："改了也没记住"）。
-            geom_blob = None
-            geom_maximized = False
-            self.cursor.execute("SELECT value FROM settings WHERE key='window_geometry'")
-            result = self.cursor.fetchone()
-            if result and result[0]:
-                try:
-                    geom_blob = QByteArray.fromBase64(result[0].encode('utf-8'))
-                except Exception:
-                    geom_blob = None
-            self.cursor.execute("SELECT value FROM settings WHERE key='window_maximized'")
-            result = self.cursor.fetchone()
-            geom_maximized = bool(result and result[0] == "1")
-
-            # ★ v4.9 【同样要先读】程序选项：下面 update_date_range() 会调 save_settings()，
-            #   若这里还没读、save_settings 却已经把键写回去，存的值就会被类级默认值盖掉
-            self.cursor.execute("SELECT value FROM settings WHERE key='scroll_bottom_after_add'")
-            result = self.cursor.fetchone()
-            if result:
-                self.scroll_bottom_after_add = (str(result[0]) == "1")
-
+                
             # 加载日期范围配置
             self.cursor.execute("SELECT value FROM settings WHERE key='date_range'")
             result = self.cursor.fetchone()
@@ -5094,10 +4744,14 @@ class FinanceApp(QMainWindow):
                 except (ValueError, TypeError):
                     pass
 
-            # 恢复窗口几何与最大化状态（★ v4.5 用函数开头读到的值，而不是重新查库）
-            if geom_blob is not None and not geom_blob.isEmpty():
-                self.restoreGeometry(geom_blob)
-            if geom_maximized:
+            # 恢复窗口几何与最大化状态
+            self.cursor.execute("SELECT value FROM settings WHERE key='window_geometry'")
+            result = self.cursor.fetchone()
+            if result and result[0]:
+                self.restoreGeometry(QByteArray.fromBase64(result[0].encode('utf-8')))
+            self.cursor.execute("SELECT value FROM settings WHERE key='window_maximized'")
+            result = self.cursor.fetchone()
+            if result and result[0] == "1":
                 self.showMaximized()
         except Exception as e:
             print(f"加载设置失败: {str(e)}")
@@ -5119,16 +4773,9 @@ class FinanceApp(QMainWindow):
             if hasattr(self, 'backup_timer'):
                 settings['backup_interval_hours'] = str(int(self.backup_timer.interval() / 3600000))
 
-            # 程序选项（★ v4.9）：添加记录后是否自动滚到列表底部
-            # 对话框里点选也会立即写同名键，这里是“退出时兵底保存”
-            settings['scroll_bottom_after_add'] = "1" if self.scroll_bottom_after_add else "0"
-
             # 窗口几何与最大化状态
-            # ★ v4.5 启动恢复期间（_geom_restoring=True）不写：否则 __init__ 里默认的
-            #   resize(1200,800) 会被当成“用户尺寸”写进库，把上次存的尺寸盖掉
-            if not self._geom_restoring:
-                settings['window_geometry'] = bytes(self.saveGeometry().toBase64()).decode('utf-8')
-                settings['window_maximized'] = "1" if self.isMaximized() else "0"
+            settings['window_geometry'] = bytes(self.saveGeometry().toBase64()).decode('utf-8')
+            settings['window_maximized'] = "1" if self.isMaximized() else "0"
 
             for key, value in settings.items():
                 self.cursor.execute(
@@ -5138,67 +4785,6 @@ class FinanceApp(QMainWindow):
             self.conn.commit()
         except Exception as e:
             print(f"保存设置失败: {str(e)}")
-
-    # ============================================================
-    # 设置对话框（★ v4.9，点选即保存，无需点保存按钮）
-    # ============================================================
-    def set_app_setting(self, key, value):
-        """写一个程序级设置（立即写库，★ v4.9）
-
-        value 统一存字符串（布尔用 '1'/'0'，与项目现有设置键风格一致）。
-        """
-        self.cursor.execute(
-            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
-            (key, str(value))
-        )
-        self.conn.commit()
-
-    def get_app_setting(self, key, default=None):
-        """读一个程序级设置（★ v4.9，缺失/异常时返回 default）"""
-        try:
-            self.cursor.execute("SELECT value FROM settings WHERE key=?", (key,))
-            row = self.cursor.fetchone()
-            return row[0] if row else default
-        except Exception:
-            return default
-
-    def open_settings(self):
-        """打开「设置」对话框（★ v4.9）
-
-        对话框内选项**点选即回调** `_on_setting_changed`（立即应用 + 写库），
-        所以没有「保存」按钮，只有「关闭」。
-        """
-        dialog = SettingsDialog(
-            self,
-            values={"scroll_bottom_after_add": self.scroll_bottom_after_add},
-            on_change=self._on_setting_changed,
-        )
-        dialog.exec_()
-        return dialog
-
-    def _on_setting_changed(self, key, value):
-        """设置项一变就立刻应用 + 写库（★ v4.9，点选即保存）"""
-        if key == "scroll_bottom_after_add":
-            self.scroll_bottom_after_add = bool(value)
-            self.statusBar().showMessage(
-                "设置已保存：添加记录后" + ("自动滚动到列表底部" if value else "保持列表位置"), 4000)
-        self.set_app_setting(key, "1" if value else "0")
-
-    def _scroll_table_to_bottom(self):
-        """添加记录后把列表滚到最底部（★ v4.9，受设置 `scroll_bottom_after_add` 控制）
-
-        新记录通常排在列表末尾，不滚到底部就看不到刚添加的那条。
-        在「添加记录」完成（已 load_data 刷新）后调用。
-        """
-        if not self.scroll_bottom_after_add:
-            return
-        table = getattr(self, "table", None)
-        if table is None:
-            return
-        try:
-            table.scrollToBottom()
-        except Exception:
-            pass
 
     def cleanup_old_temp_files(self, max_age_hours=24):
         """清理超过指定时间的临时文件"""
@@ -5269,74 +4855,9 @@ class FinanceApp(QMainWindow):
 
 
 
-    # ============================================================
-    # 窗口几何实时持久化（★ v4.4；v4.5 修恢复）
-    # 目标：拖动/缩放窗口、最大化/还原后立刻记住，而不是等到正常退出才写
-    #      （程序被强杀/崩溃时也能保留上一次的尺寸）
-    # 注：GEOMETRY_SAVE_DELAY_MS / _geom_restoring / _geom_save_timer
-    #     的默认值统一放在类开头（见 class FinanceApp 顶部说明）
-    # ============================================================
-    def _init_geometry_autosave(self):
-        """建窗口几何防抖保存定时器，并结束"启动恢复中"状态"""
-        self._geom_restoring = False
-        if self._geom_save_timer is None:
-            self._geom_save_timer = QTimer(self)
-            self._geom_save_timer.setSingleShot(True)
-            self._geom_save_timer.setInterval(self.GEOMETRY_SAVE_DELAY_MS)
-            self._geom_save_timer.timeout.connect(self._save_window_geometry)
-
-    def _schedule_geometry_save(self):
-        """窗口尺寸/位置/状态变化 → 防抖后写库（拖动过程中不写）"""
-        if self._geom_restoring:
-            return
-        timer = self._geom_save_timer
-        if timer is None:                 # __init__ 早期 resize(1200,800) 时还没建定时器
-            return
-        if not self.isVisible() or self.isMinimized():
-            return
-        timer.start()
-
-    def _save_window_geometry(self):
-        """只写窗口几何/最大化两个键（轻量，不动其它设置）"""
-        try:
-            if self.__dict__.get('conn') is None or self.__dict__.get('cursor') is None:
-                return
-            if self.isMinimized():        # 最小化时的几何不是用户想要的尺寸
-                return
-            values = {
-                'window_geometry': bytes(self.saveGeometry().toBase64()).decode('utf-8'),
-                'window_maximized': "1" if self.isMaximized() else "0",
-            }
-            for key, value in values.items():
-                self.cursor.execute(
-                    "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
-                    (key, value)
-                )
-            self.conn.commit()
-        except Exception as e:
-            print(f"保存窗口几何失败: {str(e)}")
-
-    def resizeEvent(self, event):
-        """尺寸变化 → 实时记忆（★ v4.4）"""
-        super().resizeEvent(event)
-        self._schedule_geometry_save()
-
-    def moveEvent(self, event):
-        """位置变化 → 实时记忆（★ v4.4）"""
-        super().moveEvent(event)
-        self._schedule_geometry_save()
-
-    def changeEvent(self, event):
-        """最大化/还原 → 实时记忆（★ v4.4）"""
-        super().changeEvent(event)
-        if event.type() == QEvent.WindowStateChange:
-            self._schedule_geometry_save()
-
     def closeEvent(self, event):
         """关闭窗口时清理资源"""
-        # 先停几何定时器，再强制保存一次配置（含窗口几何）
-        if self.__dict__.get('_geom_save_timer') is not None:
-            self._geom_save_timer.stop()
+        # 保存配置
         self.save_settings()
 
         # 停止定时器
@@ -5369,8 +4890,6 @@ class FinanceApp(QMainWindow):
         # 重置关键组件
         self.table = None
         self.search_edit = None
-        self.filter_panel = None
-        self.btn_reset_filters = None
         self.filter_type_combo = None
         self.filter_category_combo = None
         self.filter_account_combo = None
@@ -5665,8 +5184,7 @@ class FinanceApp(QMainWindow):
         notice_edit.setPlaceholderText(
             "把微信里收到的银行公众号交易提醒（或支付宝交易提醒）粘贴到这里，例如：\n"
             "您尾号1234的储蓄卡9月18日14:30消费人民币12.34元，账户余额1,234.56元。\n"
-            "银行 App 那种分行式的「交易提醒」（交易金额/交易附言…）也支持；\n"
-            "没有商户信息时，会把【交易附言】填到描述。"
+            "粘贴后会自动提取【交易金额 / 交易商户 / 交易时间】并填写到下方字段。"
         )
         notice_edit.setFixedHeight(96)
         notice_layout.addWidget(notice_edit)
@@ -6512,7 +6030,6 @@ class FinanceApp(QMainWindow):
             dialog.accept()
             self.statusBar().showMessage(f"✅ 待还款合计记录已添加: {total_remaining:.2f} 元", 5000)
             self.load_data()
-            self._scroll_table_to_bottom()      # ★ v4.9 添加后滚到底（设置开启时）
         else:
             dialog.accept()
             self.add_record_from_dialog(
@@ -6524,7 +6041,6 @@ class FinanceApp(QMainWindow):
                 recurring_end_edit.date().toString("yyyy-MM-dd") if recurring_check.isChecked() else None,
                 loan_combo.currentData() if type_text == "还款" else None
             )
-            self._scroll_table_to_bottom()      # ★ v4.9 添加后滚到底（设置开启时）
 
     def save_last_type(self, type_text):
         """保存最后选择的类型"""

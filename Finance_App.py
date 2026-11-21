@@ -2,20 +2,37 @@ import sys
 import sqlite3
 import shutil
 import os
+import hashlib
 import csv
 import re
 from datetime import datetime, timedelta
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+# ============================================================
+# ★ v6.0 从 PyQt5 全面迁移到 PySide6（唯一 GUI 绑定）
+#   迁移后必须记住的几个差异（实测本机 PySide6 6.11.0 / Python 3.10.11）：
+#   1. `QAction` 在 Qt6 里属于 **QtGui**（PySide6.QtWidgets 里已经没有），必须从 QtGui 导入；
+#   2. 图表模块名是 `QtCharts`（单数 `QtChart` 是 PyQt5 的叫法），类名不变；
+#   3. `exec_()` 全部改成 `exec()`（PySide6 还留着 exec_ 别名，但那是给旧代码的）；
+#   4. ★ 枚举：`QDialog.DialogCode` 是 IntEnum、`QMessageBox.StandardButton` 是 IntFlag，
+#      它们与 `exec()` 返回的 int 直接比是成立的；但 `Qt.CheckState` 是**普通 Enum**，
+#      `state == Qt.Checked`（state 是 stateChanged 发出来的 int）会**静默变成 False**
+#      —— 这类比较统一走 `qt_eq()`（见下）；
+#   5. Qt6 不再做部分隐式转换的顾虑已实测排除：`setForeground(Qt.darkGreen)`、
+#      `setBackground(Qt.red)`、`setTextAlignment(Qt.AlignCenter)` 在 PySide6 下仍然可用；
+#   6. 枚举的短写法（`Qt.AlignRight` / `QMessageBox.Yes` / `QChart.SeriesAnimations` /
+#      `QDialog.Accepted` / `QEvent.WindowStateChange`）PySide6 全都支持，不必改成限定名。
+# ============================================================
+from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QLineEdit, QPushButton, QTableWidget, QTableWidgetItem,
                              QMessageBox, QComboBox, QDateEdit, QTabWidget, QTextEdit,
-                             QAction, QFileDialog, QDialog, QFormLayout, QDialogButtonBox,
-                             QStackedWidget, QGroupBox, QInputDialog, QListWidget, QCheckBox,
-                             QSpinBox, QFrame, QGridLayout
+                             QFileDialog, QDialog, QFormLayout, QDialogButtonBox,
+                             QStackedWidget, QGroupBox, QInputDialog, QListWidget, QListWidgetItem, QCheckBox,
+                             QSpinBox, QFrame, QGridLayout, QSizePolicy, QTimeEdit
                              )
-from PyQt5.QtCore import Qt, QDate, QTimer, QSize, QByteArray, QEvent
-from PyQt5.QtGui import QIcon, QColor, QPixmap, QPainter
-from PyQt5.QtChart import QChart, QChartView, QPieSeries, QBarSeries, QBarSet, QBarCategoryAxis, QValueAxis
-from PyQt5 import QtGui, QtWidgets
+from PySide6.QtCore import Qt, QDate, QTime, QTimer, QSize, QByteArray, QEvent
+from PySide6.QtGui import QIcon, QColor, QPixmap, QPainter, QAction
+from PySide6.QtCharts import (QChart, QChartView, QPieSeries, QBarSeries, QBarSet,
+                              QBarCategoryAxis, QValueAxis)
+from PySide6 import QtGui, QtWidgets
 import pypinyin
 from PIL import Image
 import io
@@ -24,9 +41,112 @@ from cryptography.fernet import Fernet
 import calendar
 from dateutil.relativedelta import relativedelta
 
+
+def qt_eq(a, b):
+    """比较 Qt 枚举 / 枚举与整型（★ v6.0 迁移 PySide6 专门加的）
+
+    为什么不能用 `==` 直接比：PySide6 的枚举实现不统一 ——
+      • `QDialog.DialogCode` 是 IntEnum、`QMessageBox.StandardButton` 是 IntFlag，
+        它们能和 int 直接比，`dialog.exec() == QDialog.Accepted` 依旧成立；
+      • 但 `Qt.CheckState` 是**普通 Enum**，而 `QCheckBox.stateChanged` 发出来的是 int，
+        `2 == Qt.Checked` 会得到 **False**（PyQt5 下是 True）——
+        写 `visible = state == Qt.Checked` 就永远不成立（表现为：勾上「定期交易」
+        后频率/结束日期永远不出现），而且是静默错误、不报异常。
+    统一按 `.value` 比（PyQt5 的 IntEnum 下 .value 同样是个 int），两种绑定都正确。
+    """
+    return getattr(a, "value", a) == getattr(b, "value", b)
+
+
+# ============================================================
+# ★ v7.2 交易时间（时分秒）辅助函数
+#
+#   为什么**不**把时间直接拼进 transactions.date：
+#     SQLite 的 date 若写成 '2026-11-21 16:31:0600'（秒后接 4 位），
+#     strftime('%Y-%m', date) 会返回 NULL —— 全项目按月统计会**静默归零**；
+#     即使写成合法时间 '2026-11-21 16:31:06'，也会被
+#     `date BETWEEN '2026-11-01' AND '2026-11-21'` 的上界挡掉。
+#   所以 date 列保持纯净的 YYYY-MM-DD 不动（30 多处日期 SQL 一句都不用改），
+#   另开 rec_time 列存 HH:MM:SS（8 位，标准 24 小时制）：
+#     手动录入 16:31:06  → '16:31:06'
+#     老数据无时间        → '00:00:00'
+#   展示时把两列拼成 '2026-11-21 16:31:06'。
+#   ★ v7.3：早期 v7.2 曾把秒写成 4 位（'16:31:0600' / '00:00:0000'），
+#     按用户要求改回标准 2 位；升级时自动把 10 位的老值裁成前 8 位。
+# ============================================================
+REC_TIME_DEFAULT = "00:00:00"
+
+
+def rec_time_from_qtime(qtime):
+    """QTimeEdit 的 QTime → 'HH:MM:SS'（标准 2 位秒）"""
+    try:
+        if qtime is None or not qtime.isValid():
+            return REC_TIME_DEFAULT
+        return f"{qtime.hour():02d}:{qtime.minute():02d}:{qtime.second():02d}"
+    except Exception:
+        return REC_TIME_DEFAULT
+
+
+def rec_time_normalize(value):
+    """把任意历史写法规整成 'HH:MM:SS'
+
+    ★ v7.3：v7.2 存过 10 位的 '16:31:0600' / '00:00:0000'（秒 4 位），
+    这里统一裁成前 8 位；空值 / 非法值回落 REC_TIME_DEFAULT。
+    """
+    if not value:
+        return REC_TIME_DEFAULT
+    text = str(value).strip()
+    if not text:
+        return REC_TIME_DEFAULT
+    # 10 位的老格式：HH:MM:SSCC → 取前 8 位（正是 HH:MM:SS）
+    if len(text) == 10 and text[2] == ':' and text[5] == ':':
+        text = text[:8]
+    elif len(text) > 8:
+        text = text[:8]
+    # 只保留 "HH:MM:SS" 形态，其余一律回落默认值
+    parts = text.split(":")
+    if len(parts) != 3:
+        return REC_TIME_DEFAULT
+    try:
+        h, m, s = (int(p) for p in parts)
+    except (TypeError, ValueError):
+        return REC_TIME_DEFAULT
+    if not (0 <= h <= 23 and 0 <= m <= 59 and 0 <= s <= 59):
+        return REC_TIME_DEFAULT
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def rec_time_from_datetime(dt):
+    """datetime → 'HH:MM:SS'；dt 为 None 时返回 00:00:00"""
+    try:
+        if dt is None:
+            return REC_TIME_DEFAULT
+        return f"{dt.hour:02d}:{dt.minute:02d}:{dt.second:02d}"
+    except Exception:
+        return REC_TIME_DEFAULT
+
+
+def rec_time_now():
+    """当前时刻的 'HH:MM:SS'（程序内部补记的还款/退款等用它）"""
+    return rec_time_from_datetime(datetime.now())
+
+
+def format_rec_datetime(date_str, rec_time=None):
+    """把 date 与 rec_time 拼成展示用字符串
+
+    '2026-11-21' + '16:31:06' → '2026-11-21 16:31:06'
+    时间为空串时只返回日期（兼容极老的、迁移没跑过的库）。
+    ★ v7.3：内部一律过一遍 rec_time_normalize，即便库里还残留
+      v7.2 的 10 位老值（'16:31:0600'），显示出来也是标准 8 位。
+    """
+    date_str = date_str or ""
+    if not rec_time:
+        return date_str
+    return f"{date_str} {rec_time_normalize(rec_time)}"
+
+
 class ProjectInfo:
     """项目信息元数据（集中管理所有项目相关信息）"""
-    VERSION = "4.9"
+    VERSION = "7.6"
     BUILD_DATE = "2025-06-28"
     AUTHOR = "杜玛"
     LICENSE = "MIT"
@@ -52,7 +172,11 @@ class ProjectInfo:
 • 收据图片管理
 • 汇率转换
 • 交易提醒粘贴自动填写：把微信/支付宝/银行的交易提醒粘贴到「添加记录」弹窗，
-  自动提取并填写 交易金额 / 交易商户(描述) / 交易时间（没有商户时用「交易附言」当作描述）
+  自动提取并填写 交易金额 / 交易商户(描述) / 交易时间（没有商户时用「交易附言」当作描述，
+  连附言也没有时用「交易类型」后面的内容当作描述；附言只是「点击查看余额及明细」
+  这类占位引导语时也当没有，改用「交易类型」那一行）
+
+技术栈：Python 3.10 + PySide6（Qt6）+ QtCharts + pypinyin + Pillow
 """
 
     VERSION_HISTORY = {
@@ -69,20 +193,45 @@ class ProjectInfo:
         "4.6": "新增/修改/删除记录后按当前「时间范围」重算并刷新，保证范围内内容持续显示",
         "4.7": "修复「交易附言」被截断：附言改为自由文本清洗（不按逗号切、长度放宽到100字）",
         "4.8": "搜索筛选栏改为面板+网格对齐（标签右对齐、字段统一宽度），新增「重置」按钮",
-        "4.9": "新增「设置」对话框（工具 → 设置…，点选即保存）：添加记录后自动滚动到列表底部"
+        "4.9": "新增「设置」对话框（工具 → 设置…，点选即保存）：添加记录后自动滚动到列表底部",
+        "5.0": "交易提醒既无商户也无附言时，把「交易类型」后面的内容（如 收入（尾号4132账户））填入描述",
+        "5.1": "设置新增两个开关：「添加记录」窗口里可隐藏「关联借款」与「添加收据」组件",
+        "6.0": "全面迁移到 PySide6（唯一 GUI 绑定，不再依赖 PyQt5/PyQtChart）：菜单/图表/枚举比较等兼容性修正",
+        "6.1": "修复控制台刷「dataChanged() called with an invalid index range」：列表刷新时越界写了表格里不存在的第 11 列",
+        "6.2": "交易说明只是「点击查看余额及明细」这类占位引导语时忽略它，描述改用「交易类型」那一行的内容",
+        "6.3": "设置新增第三个开关可隐藏「定期交易」勾选框；压缩「交易提醒信息」区块高度（状态改单行+输入框变矮）",
+        "6.4": "「添加记录」窗口改为按内容自适应高度，修复「交易提醒信息」区块被拉出一大片空白（346px → 127px）",
+        "6.5": "「添加记录」窗口上下拉伸时，粘贴框自动跟着变大（粘贴框由固定高 68px 改为可伸缩）",
+        "6.6": "「添加记录」弹窗新增「一键还款」：类型选「还款」时出现在 OK 左边，点了自动回填第一笔关联借款的剩余金额并自动点 OK（无需手动填金额）",
+        "6.7": "新增「一键批量还款」按钮（主界面工具栏）：弹窗列出所有待还款借款，支持全选/多选/全不选，确定后逐笔按剩余金额自动还款并标记已结算",
+        "6.8": "数据库备份新增「主库 / launcher 变化即备份」：finance_master.db 每次改动(commit)后自动备份，launcher.db 随启动/每小时/退出顺带比对；均先比 md5，内容没变不备份，保留最近 30 份",
+        "6.9": "还款 / 结余全链路重算审计与 18 项缺陷修复：统一「账户余额 = 初始余额 + 流水净额」唯一公式并新增 accounts.initial_balance；修「一键批量还款」写 account_id=-1 且不重算、「一键还款」记错账户、编辑记录只重算新账户、加密模式撤销清空数据库等；新增启动余额自愈与定期交易 recurring_next_date（不再篡改历史日期）",
+        "7.0": "修复「一键还款」记成别的类型：QDialogButtonBox.addButton() 会把按钮强行 show()，导致这个按钮在任何类型下都可见，用户点它时类型还是上次留下的收入/账户结余，于是存成了收入或账户结余快照。现在按钮只在「还款」下显示、一键还款强制切类型并硬校验；弹窗也不再记忆「余额/账户结余/待还款合计」这类快照类型",
+        "7.1": "「类型」与「账户」跨重启记忆修好：主界面构造时 update_form() 把账户下拉框切到第一个账户，那个中间态被立刻当成用户选择写进库，等真正读设置时读到的已是默认值。现在加 _settings_restoring 守卫（恢复期间禁止回写）；账户同时存 id（last_account_id），账户改名也不会退回默认；切换用户后各自独立记忆",
+        "7.2": "交易记录增加时分秒：新增 rec_time 列存 HH:MM:SSCC（如 16:31:0600，秒后补两位 00 凑四位），date 列保持纯 YYYY-MM-DD 不动，因此按月统计/日期区间筛选/余额快照全都不受影响。手动添加随手填时间；粘贴交易提醒按识别到的时分秒自动填；编辑记录可改；列表/CSV/Excel 显示成「2026-11-21 16:31:0600」；同一天内按时间排序。老库启动时自动回填 00:00:00",
+        "7.3": "交易时间秒数改回标准 2 位（HH:MM:SS，如 16:31:06 / 00:00:00）：v7.2 曾按最早需求把秒写成 4 位（16:31:0600），按用户最新要求改回 2 位。新增 rec_time_normalize 统一规整，升级时自动把库里所有 10 位老值裁成前 8 位，界面上再也看不到 4 位秒",
+        "7.4": "「任何添加/删除/编辑都要重算」补齐最后几处漏刷新：待还款合计（主窗口 + 弹窗两条路径）、新增账户、编辑账户初始余额、删除账户、从备份恢复数据 —— 这 6 处以前写完库只 load_data()/load_account_table()，账户余额与「余额统计」快照不跟着变，于是界面先显示旧数字、下一次任何重算又把它改掉（多算/少算/漏算就是这么来的）。现在全部改走 refresh_after_change 统一出口；同时把 update_future_balances 里手抄的两段流水净额 SQL 收敛到唯一常量 _NET_FLOW_SQL，杜绝口径分叉",
+        "7.5": "修「计算错」而不改任何登记数据：新增「有效账户归属」EFF —— 一条还款到底算哪个账户，取决于它偿还的那笔借款属于哪个账户。历史版本的一键批量还款把 account_id 写成 -1，全库净额 0.00 而账户净额却是 -1016.46（少算 1016.46）。现在所有按账户汇总的口径（账户余额、账户快照、总快照、账户结余面板、列表账户列与按账户筛选、CSV/Excel 导出的账户列、删账户前的引用检查）统一走 EFF；启动自愈也从 0000-01-01 起把历史快照全量重算一遍，复制库进去打开就对，金额/日期/类型/account_id 一律不动",
+        "7.6": "记录多了不再一屏几百行地翻：列表改为分页显示（默认每页 100 行，可选 20/50/100/200/500，分页条在主表格下方，含首页/上一页/下一页/末页与「第 X / Y 页（共 N 条，本页 a-b 条）」）。分页只是把已经查到的结果分批画出来，查询仍是一次取全量，所以统计、余额、快照、导出、筛选全都不受影响。关掉程序时记住「上次看到哪一行」，下次打开自动回到那一页并把滚动条放回原位置；一改筛选条件就回第 1 页，避免停在第 5 页却只剩 3 条时显示空白。设置里新增「列表显示」一栏：每页行数可选，另有「列表「日期」列显示时分秒」开关（截图时临时关掉只剩纯日期，库里的时间一点不改，打开立刻恢复）。顺带修掉 v7.5 遗留的搜索崩溃：账户名已改标量子查询，但搜索条件里还写着 a.name，一输入搜索词就报 no such column: a.name",
     }
     HELP_TEXT = """
 基本操作指南：
 1. 添加记录：点击"添加记录"按钮
    （弹窗内可把微信/支付宝/银行的「交易提醒信息」粘贴到"交易提醒信息"框，
     会自动把交易金额填到金额、交易商户填到描述、交易时间填到日期，并自动选好收支类型；
-    银行 App 那种没有商户的提醒，会把「交易附言」填到描述）
+    银行 App 那种没有商户的提醒，会把「交易附言」填到描述；
+    连附言也没有时（只有 交易时间/交易类型/交易金额 三行），
+    会把「交易类型：」后面的内容（如 收入（尾号4132账户））填到描述；
+    若「交易说明」写的是「点击查看余额及明细」这类占位引导语，会忽略它、
+    同样改用「交易类型」那一行的内容）
 2. 编辑记录：选中记录后点击"编辑记录"
 3. 删除记录：选中记录后点击"删除记录"
 4. 搜索记录：使用搜索框和筛选条件
 5. 统计查看：切换到"统计分析"标签页
-6. 设置：菜单"工具 → 设置…"（★ v4.9）
-   例如开启「添加记录后自动滚动到列表底部」，新增的记录就会立刻出现在视野里；
+6. 设置：菜单"工具 → 设置…"（★ v4.9，★ v5.1 增加组件显示开关）
+   ①「添加记录后自动滚动到列表底部」：开启后新增的记录会立刻出现在视野里；
+   ②「添加记录」窗口里是否显示「关联借款」「添加收据」「定期交易」三个组件
+     （不用的可以关掉，窗口更简洁；关掉「定期交易」后就不会再把记录设成定期）。
    设置项**点选即保存**，不需要点任何保存按钮。
 
 快捷键：
@@ -127,8 +276,8 @@ F1: 显示帮助
                 "智能分类与预算控制",
                 "数据加密与备份恢复",
                 "直观的统计图表",
-                "交易提醒信息粘贴自动填写（金额 / 商户或交易附言 / 日期）",
-                "设置（工具 → 设置…，点选即保存）：添加记录后自动滚动到列表底部"
+                "交易提醒信息粘贴自动填写（金额 / 商户或交易附言或交易类型 / 日期）",
+                "设置（工具 → 设置…，点选即保存）：添加记录后自动滚动到列表底部；\n「添加记录」窗口可隐藏「关联借款」「添加收据」「定期交易」组件"
             ]
         }
 
@@ -206,6 +355,29 @@ NOTICE_MEMO_LABELS = (
     "用途", "说明", "订单标题",
 )
 
+# 「无信息量的占位引导语」（★ v6.2）：银行 App 常把「交易说明」填成
+# 「点击查看余额及明细」这种引导语 —— 它不是真的描述，遇到时应**当没取到**，
+# 让描述取值链继续往下走（用「交易类型」那一行才有意义）。
+# 用户给的实例：
+#     交易类型    收入（尾号4132储蓄账户）
+#     交易说明    点击查看余额及明细     ← 应忽略，描述取「收入（尾号4132储蓄账户）」
+NOTICE_MEMO_PLACEHOLDERS = (
+    "点击查看余额及明细", "查看余额及明细", "点击查看余额明细", "余额及明细",
+    "点击查看余额", "查看余额", "点击查看明细", "查看明细",
+    "点击查看详情", "查看详情", "点击查看账单", "查看账单",
+    "点击查看记录", "查看记录", "点击查看", "更多详情请点击查看",
+)
+# 由这些引导词拼出来的文案（如「点击查看余额及明细」）也算占位语
+NOTICE_MEMO_PLACEHOLDER_TOKENS = (
+    "点击查看", "点击", "查看", "浏览", "余额", "明细", "详情", "账单", "记录", "及", "和",
+)
+
+# 「交易类型」标签（★ v5.0：既没有商户、也没有附言时，把这行后面的内容当描述）
+# 例：「交易类型：收入（尾号4132账户）」→ 描述 = 「收入（尾号4132账户）」
+NOTICE_TYPE_LABELS = (
+    "交易类型", "交易种类", "收支类型", "业务类型",
+)
+
 # 时间标签（暂未强制依赖，日期整体扫描已足够）
 NOTICE_TIME_LABELS = ("交易时间", "交易日期时间", "交易日期", "发生时间", "记账时间", "日期", "时间")
 
@@ -233,8 +405,9 @@ NOTICE_DATE_Y_RE = re.compile(r"(?<!\d)(20\d{2})\s*[-/年.]\s*(\d{1,2})\s*[-/月
 NOTICE_DATE_CN_RE = re.compile(r"(?<!\d)(\d{1,2})\s*月\s*(\d{1,2})\s*日?")
 NOTICE_DATE_SLASH_RE = re.compile(r"(?<!\d)(\d{1,2})\s*[-/]\s*(\d{1,2})\s*日")
 
-# 时间：HH:MM 或 14时30分 / 14点30
-NOTICE_TIME_RE = re.compile(r"(?P<h>\d{1,2})\s*[:：]\s*(?P<m>\d{1,2})")
+# 时间：HH:MM[:SS] 或 14时30分 / 14点30（★ v7.2 起支持秒，银行提醒常见 16:31:06）
+NOTICE_TIME_RE = re.compile(
+    r"(?P<h>\d{1,2})\s*[:：]\s*(?P<m>\d{1,2})(?:\s*[:：]\s*(?P<s>\d{1,2}))?")
 NOTICE_TIME_CN_RE = re.compile(r"(?P<h>\d{1,2})\s*[时点]\s*(?:(?P<m>\d{1,2})\s*分?)?")
 
 
@@ -477,13 +650,64 @@ def notice_parse_memo(text):
 
     例：交易附言    存银行-DCEP010144081682 → "存银行-DCEP010144081682"
     附言属于**自由文本**，走 `_notice_clean_memo`（不按逗号等标点截断，★ v4.7）。
+
+    ★ v6.2：如果是「点击查看余额及明细」这类**占位引导语**，返回 None ——
+    让描述取值链继续落到「交易类型」那一行（那条才有信息量）。
     """
-    return _notice_labelled_value(text, NOTICE_MEMO_LABELS, max_len=120,
+    val = _notice_labelled_value(text, NOTICE_MEMO_LABELS, max_len=120,
+                                 cleaner=_notice_clean_memo)
+    if _notice_is_placeholder_memo(val):
+        return None
+    return val
+
+
+def _notice_is_placeholder_memo(text):
+    """判断「交易说明/附言」是不是银行 App 的无信息量占位语（★ v6.2）
+
+    两类都算：
+      ① 命中 `NOTICE_MEMO_PLACEHOLDERS` 的固定文案（比对前去掉空白与首尾标点）；
+      ② 整串只由「点击/查看/余额/明细/账单…」这类引导词拼成（如「点击查看余额及明细」）。
+    真正的附言（「存银行-DCEP…」「超市消费」「银联无卡转账,对手户名…」）不会命中。
+    """
+    if not text:
+        return False
+    s = re.sub(r"[\s\u3000]+", "", str(text))
+    s = s.strip("，,。.；;、:：!！?？-—>＞·\"'“”‘’")
+    if not s:
+        return False
+    if not re.search(r"[\u4e00-\u9fff]", s):      # 没有中文的（如订单号）不算占位语
+        return False
+    if s in NOTICE_MEMO_PLACEHOLDERS:
+        return True
+    rest = s
+    for tok in NOTICE_MEMO_PLACEHOLDER_TOKENS:
+        rest = rest.replace(tok, "")
+    return rest == ""
+
+
+def notice_parse_type_text(text):
+    """提取「交易类型」标签后面的整段文字（★ v5.0）→ 清洗后的字符串 或 None
+
+    场景（用户反馈）：有些交易提醒既没有商户、也没有附言/摘要/备注，只有
+        交易时间：2026年6月18日 12:34:14
+        交易类型：收入（尾号4132账户）
+        交易金额：1198.80（人民币）
+    此时描述会空着。把「交易类型：」后面的内容（含账户尾号等）当描述填进去，
+    比留空更有信息量。
+
+    属于**自由文本**，同样走 `_notice_clean_memo`（不按标点截断、去首尾修饰、
+    在同行的后续字段名处断开，例如「支出 交易金额 12.34」只留「支出」）。
+    """
+    return _notice_labelled_value(text, NOTICE_TYPE_LABELS, max_len=80,
                                   cleaner=_notice_clean_memo)
 
 
 def _notice_find_time(s):
-    """在字符串中找 HH:MM → (hour, minute) 或 None（识别 下午/晚上）"""
+    """在字符串中找 HH:MM[:SS] → (hour, minute, second) 或 None（识别 下午/晚上）
+
+    ★ v7.2：多返回秒（识别不到秒时按 0）。银行提醒常见「16:31:06」这种写法，
+      以前只取到分钟，秒被丢掉，落库就成了整分。
+    """
     if not s:
         return None
     for rx in (NOTICE_TIME_RE, NOTICE_TIME_CN_RE):
@@ -491,14 +715,16 @@ def _notice_find_time(s):
             try:
                 h = int(m.group("h"))
                 mi = int(m.group("m") or 0)
-            except (TypeError, ValueError):
+                groups = m.groupdict()
+                sec = int(groups.get("s") or 0)
+            except (TypeError, ValueError, IndexError):
                 continue
-            if not (0 <= h <= 23 and 0 <= mi <= 59):
+            if not (0 <= h <= 23 and 0 <= mi <= 59 and 0 <= sec <= 59):
                 continue
             ctx = s[max(0, m.start() - 4): m.start()]
             if h < 12 and any(w in ctx for w in ("下午", "晚上", "傍晚", "夜")):
                 h += 12
-            return h, mi
+            return h, mi, sec
     return None
 
 
@@ -552,8 +778,8 @@ def notice_parse_datetime(text, now=None):
     if date_part is None:
         return None
 
-    h, mi = hm if hm else (0, 0)
-    return datetime(date_part.year, date_part.month, date_part.day, h, mi)
+    h, mi, sec = hm if hm else (0, 0, 0)
+    return datetime(date_part.year, date_part.month, date_part.day, h, mi, sec)
 
 
 def notice_parse_type(text):
@@ -597,9 +823,14 @@ def notice_parse_type(text):
 
 
 def parse_transaction_notice(text, now=None):
-    """解析交易提醒文本 → dict(amount, merchant, memo, datetime, date, type)"""
+    """解析交易提醒文本
+
+    → dict(amount, merchant, memo, type_text, datetime, date, type)
+
+    type_text（★ v5.0）=「交易类型」后面的文字，仅在没有商户也没有附言时用作描述。
+    """
     text = (text or "").strip()
-    empty = {"amount": None, "merchant": None, "memo": None,
+    empty = {"amount": None, "merchant": None, "memo": None, "type_text": None,
              "datetime": None, "date": None, "type": None}
     if not text:
         return empty
@@ -608,6 +839,7 @@ def parse_transaction_notice(text, now=None):
         "amount": notice_parse_amount(text),
         "merchant": notice_parse_merchant(text),
         "memo": notice_parse_memo(text),
+        "type_text": notice_parse_type_text(text),
         "datetime": dt,
         "date": dt.strftime("%Y-%m-%d") if dt else None,
         "type": notice_parse_type(text),
@@ -615,7 +847,7 @@ def parse_transaction_notice(text, now=None):
 
 
 def apply_transaction_notice(info, type_combo, amount_edit, desc_edit, date_edit,
-                             enable_amount=False):
+                             enable_amount=False, time_edit=None):
     """把 parse_transaction_notice 的结果填入「添加记录」各控件
 
     返回 (filled, skipped)：已填写项 / 跳过项的文字说明列表。
@@ -639,21 +871,27 @@ def apply_transaction_notice(info, type_combo, amount_edit, desc_edit, date_edit
         else:
             skipped.append("金额(当前类型不可编辑)")
 
-    # 描述 = 交易商户；没有商户时退回「交易附言/摘要/备注」（★ v4.2）
+    # 描述取值链（★ v4.2 / ★ v5.0）：
+    #   ① 交易商户 ② 交易附言/摘要/备注 ③ 「交易类型」后面的文字（只有前两者都没有时才用）
     if info.get("merchant"):
         desc_edit.setText(info["merchant"])
         filled.append("描述=" + info["merchant"])
     elif info.get("memo"):
         desc_edit.setText(info["memo"])
         filled.append("描述=" + info["memo"] + "（交易附言）")
+    elif info.get("type_text"):
+        desc_edit.setText(info["type_text"])
+        filled.append("描述=" + info["type_text"] + "（交易类型）")
 
-    # 日期 = 交易时间
+    # 日期 + 时间 = 交易时间（★ v7.2 精确到秒，v7.3 秒 2 位；识别不到时间的按 00:00:00）
     if info.get("datetime"):
         dt = info["datetime"]
         qdate = QDate(dt.year, dt.month, dt.day)
         if qdate.isValid():
             date_edit.setDate(qdate)
-            filled.append("日期=" + dt.strftime("%Y-%m-%d %H:%M"))
+            if time_edit is not None:
+                time_edit.setTime(QTime(dt.hour, dt.minute, dt.second))
+            filled.append("日期=" + dt.strftime("%Y-%m-%d %H:%M:%S"))
 
     return filled, skipped
 
@@ -739,7 +977,7 @@ class LoginDialog(QDialog):
         
         layout.addLayout(button_layout)
         dialog.setLayout(layout)
-        dialog.exec_()
+        dialog.exec()
     
     def load_user_list(self):
         """加载用户列表"""
@@ -781,7 +1019,7 @@ class LoginDialog(QDialog):
                 if os.path.exists(old_db):
                     os.rename(old_db, new_db)
                 
-                self.master_conn.commit()
+                self.commit_master()
                 self.load_user_list()
                 self.load_users([row[0] for row in self.master_cursor.execute("SELECT username FROM users")])
                 
@@ -827,7 +1065,7 @@ class LoginDialog(QDialog):
                     except:
                         pass
                 
-                self.master_conn.commit()
+                self.commit_master()
                 self.load_user_list()
                 self.load_users([row[0] for row in self.master_cursor.execute("SELECT username FROM users")])
                 
@@ -845,8 +1083,11 @@ class SettingsDialog(QDialog):
     （见 软件升级迭代记录.md 维护要点 5）。
 
     以后新增选项：在 `_build_ui` 里加控件 + 用 `self._bind_bool(控件, "键名")` 绑定即可，
-    主窗口只需在 `load_settings` / `save_settings` 里补上同名键。
+    主窗口只需在 `load_settings` / `save_settings` / `_on_setting_changed` 里补上同名键。
     """
+
+    # ★ v7.6 每页行数可选档位（与 FinanceApp.PAGE_SIZE_CHOICES 保持一致）
+    PAGE_SIZE_CHOICES = (20, 50, 100, 200, 500)
 
     def __init__(self, parent=None, values=None, on_change=None):
         """
@@ -881,6 +1122,57 @@ class SettingsDialog(QDialog):
         group_layout.addWidget(self.chk_scroll_bottom)
 
         layout.addWidget(group)
+
+        # ---- 「添加记录」窗口里显示哪些组件（★ v5.1）----
+        group2 = QGroupBox("「添加记录」窗口里显示的组件")
+        group2_layout = QVBoxLayout(group2)
+        group2_layout.setSpacing(6)
+
+        self.chk_show_loan_combo = QCheckBox("显示「关联借款」（选「还款」时可关联到某笔借款）")
+        self.chk_show_loan_combo.setToolTip(
+            "关闭后，「添加记录」窗口不再出现「关联借款」下拉框；\n"
+            "此时还款记录不会关联到具体借款（等同于选「无待还款借款」）。")
+        group2_layout.addWidget(self.chk_show_loan_combo)
+
+        self.chk_show_receipt_btn = QCheckBox("显示「添加收据」按钮")
+        self.chk_show_receipt_btn.setToolTip(
+            "关闭后，「添加记录」窗口不再出现「添加收据」按钮，\n"
+            "新记录也就不能再附收据图片（已有的收据不受影响）。")
+        group2_layout.addWidget(self.chk_show_receipt_btn)
+
+        self.chk_show_recurring_check = QCheckBox("显示「定期交易」勾选框")
+        self.chk_show_recurring_check.setToolTip(
+            "关闭后，「添加记录」窗口不再出现「定期交易」勾选框（连同「频率 / 结束于」两行），\n"
+            "就只记一笔普通流水；关闭时会自动取消勾选，不会把记录误设成定期。")
+        group2_layout.addWidget(self.chk_show_recurring_check)
+
+        layout.addWidget(group2)
+
+        # ---- 列表显示（★ v7.6 分页 / 时间显示）----
+        group3 = QGroupBox("列表显示")
+        group3_layout = QVBoxLayout(group3)
+        group3_layout.setSpacing(6)
+
+        row_page = QHBoxLayout()
+        row_page.addWidget(QLabel("每页显示行数:"))
+        self.page_size_combo = QComboBox()
+        for _n in SettingsDialog.PAGE_SIZE_CHOICES:
+            self.page_size_combo.addItem(f"{_n} 行", _n)
+        self.page_size_combo.setFixedWidth(110)
+        self.page_size_combo.setToolTip(
+            "只影响列表一次显示多少行，不影响任何计算、统计和导出。\n"
+            "改完立刻生效并保存，下次打开还是这个行数。")
+        row_page.addWidget(self.page_size_combo)
+        row_page.addStretch(1)
+        group3_layout.addLayout(row_page)
+
+        self.chk_show_time = QCheckBox("列表「日期」列显示时分秒（截图时可以临时关掉）")
+        self.chk_show_time.setToolTip(
+            "关闭后列表只显示纯日期（如 2026-11-21），方便截图时隐去具体时间；\n"
+            "数据库里的时间一个字都不会被改动，重新打开开关立刻原样显示回来。")
+        group3_layout.addWidget(self.chk_show_time)
+
+        layout.addWidget(group3)
         layout.addStretch(1)
 
         btn_row = QHBoxLayout()
@@ -894,7 +1186,33 @@ class SettingsDialog(QDialog):
         # ★ 先 setChecked 再连信号：避免构造时用默认值误触发一次“变化”
         self.chk_scroll_bottom.setChecked(
             bool(self._values.get("scroll_bottom_after_add", False)))
+        self.chk_show_loan_combo.setChecked(
+            bool(self._values.get("show_loan_combo", True)))
+        self.chk_show_receipt_btn.setChecked(
+            bool(self._values.get("show_receipt_btn", True)))
+        self.chk_show_recurring_check.setChecked(
+            bool(self._values.get("show_recurring_check", True)))
         self._bind_bool(self.chk_scroll_bottom, "scroll_bottom_after_add")
+        self._bind_bool(self.chk_show_loan_combo, "show_loan_combo")
+        self._bind_bool(self.chk_show_receipt_btn, "show_receipt_btn")
+        self._bind_bool(self.chk_show_recurring_check, "show_recurring_check")
+
+        # ★ v7.6 列表显示：每页行数（下拉框）+ 时间显示开关
+        _cur_size = int(self._values.get("page_size", 100) or 100)
+        _idx = self.page_size_combo.findData(_cur_size)
+        self.page_size_combo.setCurrentIndex(_idx if _idx >= 0 else 0)
+        self.page_size_combo.currentIndexChanged.connect(
+            lambda _i: self._emit("page_size", int(self.page_size_combo.currentData() or 100)))
+        self.chk_show_time.setChecked(bool(self._values.get("show_time_in_list", True)))
+        self._bind_bool(self.chk_show_time, "show_time_in_list")
+
+        # 让 result_values() 始终包含全部选项（调用方没传值时也返回控件当前值）
+        self._values.setdefault("scroll_bottom_after_add", self.chk_scroll_bottom.isChecked())
+        self._values.setdefault("show_loan_combo", self.chk_show_loan_combo.isChecked())
+        self._values.setdefault("show_receipt_btn", self.chk_show_receipt_btn.isChecked())
+        self._values.setdefault("show_recurring_check", self.chk_show_recurring_check.isChecked())
+        self._values.setdefault("page_size", int(self.page_size_combo.currentData() or 100))
+        self._values.setdefault("show_time_in_list", self.chk_show_time.isChecked())
 
     def _bind_bool(self, checkbox, key):
         """复选框 ↔ 设置键（★ v4.9）：一变就写值 + 立刻回调（点选即保存）"""
@@ -922,9 +1240,35 @@ class FinanceApp(QMainWindow):
     _geom_restoring = False
     _geom_save_timer = None
 
+    # ★ v7.1 设置恢复期间禁止 save_last_* 回写（同 _geom_restoring 的理由）：
+    #   构造/重建界面时控件会先落到默认值，此时若回写，就会把上次保存的
+    #   「类型 / 账户 / 类别」用默认值覆盖掉，等 load_settings 再读只剩默认值。
+    #   放类级，保证任何构造阶段（含 __new__ 出来的测试实例）都能安全取到。
+    _settings_restoring = False
+
     # 添加记录后是否自动把列表滚到最底部（★ v4.9，可在「工具 → 设置…」里改）
     # 同样放类级：任何构造阶段（含 __new__ 出来的测试实例）都能安全取到
     scroll_bottom_after_add = False
+
+    # 「添加记录」弹窗里三个可选组件的显示开关（★ v5.1，第三个 ★ v6.3）
+    show_loan_combo = True         # 「关联借款」下拉框（本来也只在 还款/待还款合计 类型下出现）
+    show_receipt_btn = True        # 「添加收据」按钮
+    show_recurring_check = True    # 「定期交易」勾选框（连同「频率 / 结束于」两行）
+
+    # ============================================================
+    # ★ v7.6 列表分页 + 时间显示开关（**纯显示层**）
+    #   分页只切「显示」的切片，SQL 仍然全量取回 —— 余额、统计、导出、
+    #   待还款合计、快照重算一律不看这些属性，所以绝不影响任何计算结果。
+    #   放类级：sip 对象 getattr 不存在的属性会抛 RuntimeError（同 1198 行说明）。
+    # ============================================================
+    PAGE_SIZE_CHOICES = (20, 50, 100, 200, 500)
+    page_size = 100                 # 每页行数（可在分页条里改，实时落库）
+    show_time_in_list = True        # 列表「日期」列是否带 HH:MM:SS
+    _page_anchor = 0                # 列表锚点 = 当前页第一行的全局行号（跨重启记忆）
+    _page_index = 0                 # 当前页（0 起，由锚点推导）
+    _page_start_index = 0           # 本页第一行的全局行号
+    _all_records = None             # 最近一次筛选出的**全部**记录（分页只做切片）
+    _restore_scroll_pending = False # 启动恢复时要滚到锚点那一行
 
     def __init__(self):
         super().__init__()
@@ -961,6 +1305,9 @@ class FinanceApp(QMainWindow):
         self.backup_timer = QTimer()
         self.backup_timer.timeout.connect(self.auto_backup)
         self.backup_timer.start(3600000)  # 每小时自动备份一次
+
+        # ★ v6.8 启动时对主库 / launcher 各做一次变化即备份（抓启动期变化）
+        self.auto_backup_external()
         
         # 操作历史栈
         self.operation_stack = []
@@ -985,6 +1332,12 @@ class FinanceApp(QMainWindow):
         self._geom_restoring = True
         self._geom_save_timer = None
 
+        # ★ v7.1 下面 create_input_form() 会先跑一次 update_form()，把账户下拉框
+        #   从「全部结余」切到第一个账户——这个切换会触发 save_last_account。
+        #   此时真正的 load_settings() 还没执行，一旦让它写库，上次保存的账户
+        #   就被「现金账户」覆盖了。所以整个重建 + 恢复期间一律禁止回写。
+        self._settings_restoring = True
+
         # 创建UI组件（不调用reset_ui()）
         # self.create_search_bar()
         # self.create_tabs()
@@ -1005,6 +1358,9 @@ class FinanceApp(QMainWindow):
         
         # 现在可以安全加载设置
         self.load_settings()
+
+        # ★ v7.1 设置已恢复完毕，之后用户的每次选择才允许实时落盘
+        self._settings_restoring = False
 
         # 窗口几何实时保存（★ v4.4）：恢复完成后再启用监听
         self._init_geometry_autosave()
@@ -1064,13 +1420,13 @@ class FinanceApp(QMainWindow):
             )
         ''')
 
-        self.master_conn.commit()
+        self.commit_master()
         
         # 检查是否有默认用户
         self.master_cursor.execute("SELECT COUNT(*) FROM users")
         if self.master_cursor.fetchone()[0] == 0:
             self.master_cursor.execute("INSERT INTO users (username) VALUES (?)", ("默认用户",))
-            self.master_conn.commit()
+            self.commit_master()
 
     def init_current_user_db(self, username):
         """初始化当前用户数据库"""
@@ -1126,6 +1482,8 @@ class FinanceApp(QMainWindow):
                 is_recurring INTEGER DEFAULT 0,  -- 是否为定期交易
                 recurring_freq TEXT,  -- 定期频率: daily, weekly, monthly, yearly
                 recurring_end TEXT,  -- 定期结束日期
+                recurring_next_date TEXT,  -- ★ v6.9 下次执行日（不再改 date 篡改历史）
+                rec_time TEXT,  -- ★ v7.2/7.3 交易时间 HH:MM:SS（date 保持 YYYY-MM-DD 纯净）
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 user_id INTEGER REFERENCES users(id)
             )
@@ -1152,7 +1510,9 @@ class FinanceApp(QMainWindow):
                 balance REAL DEFAULT 0,
                 currency TEXT DEFAULT 'CNY',
                 description TEXT,
-                user_id INTEGER REFERENCES users(id)
+                user_id INTEGER REFERENCES users(id),
+                -- ★ v6.9 账户初始余额：余额 = initial_balance + 流水净额
+                initial_balance REAL DEFAULT 0
             )
         ''')
         
@@ -1199,8 +1559,9 @@ class FinanceApp(QMainWindow):
         if self.cursor.fetchone()[0] == 0:
             try:
                 self.cursor.execute(
-                    "INSERT INTO accounts (name, balance, currency) VALUES (?, ?, ?)",
-                    ("现金账户", 0, "CNY")
+                    "INSERT INTO accounts (name, balance, currency, initial_balance) "
+                    "VALUES (?, ?, ?, ?)",
+                    ("现金账户", 0, "CNY", 0)
                 )
             except sqlite3.Error as e:
                 print(f"添加默认账户失败: {str(e)}")
@@ -1252,6 +1613,25 @@ class FinanceApp(QMainWindow):
         # 升级旧的借款记录，设置默认值
         self.upgrade_old_loans()
 
+        # ★ v6.9 启动自愈：按「initial_balance + 流水净额」对齐一次全部账户余额。
+        #   以前 load_data 只对有状态变化的「借款」账户调 update_account_balance，
+        #   没有借款的账户永远不会被重算，余额可以长期停在旧算法的错值上。
+        #   放在建表/迁移之后，保证 initial_balance 列一定已存在。
+        try:
+            self._recalc_all_account_balances()
+        except Exception as e:
+            print(f"[init_current_user_db] 启动余额自愈失败: {e}")
+
+        # ★ v7.5 启动自愈（第二步）：把历史余额快照按新口径全量重算一遍。
+        #   只重算账户余额还不够 —— transactions 里那些 type='balance' 的快照
+        #   是当年按错口径写进去的存量值（李红玲库 id=741 存的 -1016.46，
+        #   正确值是 -1118.32），不重算就永远留在表里，「余额统计」照样错。
+        #   从 0000-01-01 起算 = 全量覆盖，用户点开程序就已经是对的。
+        try:
+            self.update_future_balances("0000-01-01")
+        except Exception as e:
+            print(f"[init_current_user_db] 启动快照重算失败: {e}")
+
 
     def upgrade_old_loans(self):
         """升级旧的借款记录，设置默认值"""
@@ -1282,6 +1662,10 @@ class FinanceApp(QMainWindow):
         
         if 'recurring_end' not in columns:
             self.cursor.execute("ALTER TABLE transactions ADD COLUMN recurring_end TEXT")
+        
+        # ★ v6.9：定期交易的「下次执行日」独立成列，不再挪用 date
+        if 'recurring_next_date' not in columns:
+            self.cursor.execute("ALTER TABLE transactions ADD COLUMN recurring_next_date TEXT")
         
         self.conn.commit()
 
@@ -1314,7 +1698,13 @@ class FinanceApp(QMainWindow):
             ('receipt_image', 'TEXT', ''),
             ('is_recurring', 'INTEGER', 'DEFAULT 0'),
             ('recurring_freq', 'TEXT', ''),
-            ('recurring_end', 'TEXT', '')
+            ('recurring_end', 'TEXT', ''),
+            # ★ v6.9：定期交易下次执行日（必须进迁移清单，否则老库 ALTER 不到、
+            #   execute_recurring_transaction 写库会 no such column）
+            ('recurring_next_date', 'TEXT', ''),
+            # ★ v7.2/7.3：交易时间 HH:MM:SS（v7.3 起秒 2 位）。date 列仍是纯 YYYY-MM-DD，
+            #   按月统计 / 区间筛选的 SQL 一句都不用改。
+            ('rec_time', 'TEXT', '')
         ]
         
         # 添加缺失的列
@@ -1328,6 +1718,66 @@ class FinanceApp(QMainWindow):
             if default_value and not default_value.startswith('DEFAULT'):
                 sql = f"UPDATE transactions SET {column_name} = {default_value} WHERE {column_name} IS NULL"
                 self.cursor.execute(sql)
+
+        # ★ v7.2/7.3：老库没有交易时间 —— 统一补 00:00:00（不是空串）。
+        #   空串会让展示层拼出「2026-11-21 」带尾空格的怪样子，也会让
+        #   ORDER BY rec_time 与 '00:00:00' 混排出两种形态。
+        #   NULL 与 '' 都要补：老版本 ALTER 加列时给的是 NULL，
+        #   早前手工改过的库可能有 ''。
+        self.cursor.execute(
+            "UPDATE transactions SET rec_time=? "
+            "WHERE rec_time IS NULL OR TRIM(rec_time)=''",
+            (REC_TIME_DEFAULT,))
+
+        # ★ v7.3：v7.2 曾把秒写成 4 位（'16:31:0600' / '00:00:0000'），
+        #   按用户要求改回标准 2 位 —— 把库里所有超过 8 位的老值裁成前 8 位
+        #   （'16:31:0600'[:8] 正是 '16:31:06'）。用 SQL 批量做，几万条也瞬间完成。
+        self.cursor.execute(
+            "UPDATE transactions SET rec_time = SUBSTR(TRIM(rec_time), 1, 8) "
+            "WHERE rec_time IS NOT NULL AND LENGTH(TRIM(rec_time)) > 8")
+        
+        # ★ v6.9 账户表补 initial_balance（老库没有这一列）
+        #   回填口径：initial_balance = 当前balance - 该账户流水净额
+        #   → 升级瞬间**每个账户显示余额一分不变**（不破坏既有行为），
+        #     但从此「初始余额」是显式落库的，后续任何重算都不会再把它吃掉。
+        #   ★ 注意：本函数在 accounts 建表**之前**被调用（见 init_current_user_db），
+        #     全新库此时根本没有 accounts 表，PRAGMA 返回空列表 → 若不判存在性
+        #     直接 ALTER 会抛 "no such table: accounts"，启动即崩。
+        self.cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='accounts'")
+        if not self.cursor.fetchone():
+            self.conn.commit()
+            return
+        self.cursor.execute("PRAGMA table_info(accounts)")
+        acc_columns = [column[1] for column in self.cursor.fetchall()]
+        if 'initial_balance' not in acc_columns:
+            self.cursor.execute(
+                "ALTER TABLE accounts ADD COLUMN initial_balance REAL DEFAULT 0")
+            self.cursor.execute("SELECT id, IFNULL(balance, 0) FROM accounts")
+            for acc_id, cur_balance in self.cursor.fetchall():
+                # ★ v7.5 注意：这里**故意**仍用裸 account_id，不要换成有效归属。
+                #   本段是在“反推”老库的初始余额：initial = 当时余额 - 当时的流水净额。
+                #   当时的余额就是用裸 account_id 算出来的，两边口径必须一致，
+                #   才能把用户当初填的初始余额原样还原出来。还原之后启动自愈
+                #   （_recalc_all_account_balances，已改用有效归属）会重算出正确余额。
+                #   若这里改用有效归属，反而会把历史错误永久固化进 initial_balance。
+                self.cursor.execute("""
+                    SELECT 
+                        SUM(CASE WHEN type='income' THEN amount ELSE 0 END) -
+                        SUM(CASE WHEN type='expense' THEN amount ELSE 0 END) +
+                        SUM(CASE WHEN type='还款' THEN amount ELSE 0 END) -
+                        SUM(CASE WHEN type='借款' THEN amount ELSE 0 END)
+                    FROM transactions
+                    WHERE account_id=? AND type != 'balance'
+                """, (acc_id,))
+                flow = self.cursor.fetchone()[0] or 0
+                self.cursor.execute(
+                    "UPDATE accounts SET initial_balance=? WHERE id=?",
+                    (cur_balance - flow, acc_id))
+        else:
+            # 列已在（新建库或已升级过）：NULL 一律补 0，避免 SUM 出现 NULL
+            self.cursor.execute(
+                "UPDATE accounts SET initial_balance=0 WHERE initial_balance IS NULL")
         
         self.conn.commit()
 
@@ -1407,7 +1857,7 @@ class FinanceApp(QMainWindow):
             "UPDATE users SET password=? WHERE username=?",
             (password, self.current_user)
         )
-        self.master_conn.commit()
+        self.commit_master()
         
         self.db_encrypted = True
         self.cipher_suite = cipher_suite
@@ -1450,7 +1900,7 @@ class FinanceApp(QMainWindow):
                 "UPDATE users SET password=NULL WHERE username=?",
                 (self.current_user,)
             )
-            self.master_conn.commit()
+            self.commit_master()
             
             self.db_encrypted = False
             self.cipher_suite = None
@@ -1488,7 +1938,7 @@ class FinanceApp(QMainWindow):
             # 如果settings表不存在，忽略错误
             pass
                     
-        if login_dialog.exec_() == QDialog.Accepted:
+        if login_dialog.exec() == QDialog.Accepted:
             username = login_dialog.user_combo.currentText()
             new_user = login_dialog.new_user_edit.text().strip()
             password = login_dialog.password_edit.text()
@@ -1501,7 +1951,7 @@ class FinanceApp(QMainWindow):
                         "INSERT INTO users (username, password) VALUES (?, ?)",
                         (new_user, password if remember else None)
                     )
-                    self.master_conn.commit()
+                    self.commit_master()
                     username = new_user
                 except sqlite3.IntegrityError:
                     self.statusBar().showMessage("❌ 用户名已存在!", 5000) 
@@ -1513,7 +1963,7 @@ class FinanceApp(QMainWindow):
                     "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
                     ('last_user', username)
                 )
-                self.master_conn.commit()
+                self.commit_master()
             except sqlite3.OperationalError:
                 # 如果settings表不存在，先创建表
                 self.master_cursor.execute('''
@@ -1522,13 +1972,13 @@ class FinanceApp(QMainWindow):
                         value TEXT
                     )
                 ''')
-                self.master_conn.commit()
+                self.commit_master()
                 # 再次尝试保存
                 self.master_cursor.execute(
                     "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
                     ('last_user', username)
                 )
-                self.master_conn.commit()
+                self.commit_master()
         
             self.init_current_user_db(username)
         else:
@@ -1662,6 +2112,8 @@ class FinanceApp(QMainWindow):
         if self.table is None:
             self.create_data_table()
         transaction_layout.addWidget(self.table)
+        # ★ v7.6 分页条（首页/上一页/页码/下一页/末页 + 每页行数）
+        transaction_layout.addLayout(self._create_pagination_bar())
         
         # 统计分析标签页
         self.stats_tab = QWidget()
@@ -1772,7 +2224,7 @@ class FinanceApp(QMainWindow):
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("搜索描述、金额或分类...")
         self.search_edit.setClearButtonEnabled(True)
-        self.search_edit.textChanged.connect(self.apply_filters)
+        self.search_edit.textChanged.connect(self._on_filter_changed)
         row_search.addWidget(self.search_edit, 1)
 
         self.btn_reset_filters = QPushButton("重置")
@@ -1792,28 +2244,28 @@ class FinanceApp(QMainWindow):
         # 第 1 组：类型
         self.filter_type_combo = QComboBox()
         self.filter_type_combo.addItems(["所有类型", "收入", "支出", "借款", "还款"])
-        self.filter_type_combo.currentIndexChanged.connect(self.apply_filters)
+        self.filter_type_combo.currentIndexChanged.connect(self._on_filter_changed)
         grid.addWidget(_lab("类型:"), 0, 0)
         grid.addWidget(_compact(self.filter_type_combo), 0, 1)
 
         # 第 2 组：分类
         self.filter_category_combo = QComboBox()
         self.filter_category_combo.addItem("所有分类")
-        self.filter_category_combo.currentIndexChanged.connect(self.apply_filters)
+        self.filter_category_combo.currentIndexChanged.connect(self._on_filter_changed)
         grid.addWidget(_lab("分类:"), 0, 2)
         grid.addWidget(_compact(self.filter_category_combo), 0, 3)
 
         # 第 3 组：账户
         self.filter_account_combo = QComboBox()
         self.filter_account_combo.addItem("所有账户")
-        self.filter_account_combo.currentIndexChanged.connect(self.apply_filters)
+        self.filter_account_combo.currentIndexChanged.connect(self._on_filter_changed)
         grid.addWidget(_lab("账户:"), 0, 4)
         grid.addWidget(_compact(self.filter_account_combo), 0, 5)
 
         # 第 4 组：状态
         self.filter_status_combo = QComboBox()
         self.filter_status_combo.addItems(["所有状态", "待还款", "已结清"])
-        self.filter_status_combo.currentIndexChanged.connect(self.apply_filters)
+        self.filter_status_combo.currentIndexChanged.connect(self._on_filter_changed)
         grid.addWidget(_lab("状态:"), 0, 6)
         grid.addWidget(_compact(self.filter_status_combo), 0, 7)
 
@@ -1829,7 +2281,7 @@ class FinanceApp(QMainWindow):
         self.date_from_edit.setDate(QDate.currentDate().addMonths(-1))
         self.date_from_edit.setCalendarPopup(True)
         self.date_from_edit.setFixedWidth(FILTER_FIELD_WIDTH)
-        self.date_from_edit.dateChanged.connect(self.apply_filters)
+        self.date_from_edit.dateChanged.connect(self._on_filter_changed)
         grid.addWidget(_lab("从:"), 1, 2)
         grid.addWidget(self.date_from_edit, 1, 3)
 
@@ -1838,7 +2290,7 @@ class FinanceApp(QMainWindow):
         self.date_to_edit.setDate(QDate.currentDate())
         self.date_to_edit.setCalendarPopup(True)
         self.date_to_edit.setFixedWidth(FILTER_FIELD_WIDTH)
-        self.date_to_edit.dateChanged.connect(self.apply_filters)
+        self.date_to_edit.dateChanged.connect(self._on_filter_changed)
         grid.addWidget(_lab("到:"), 1, 4)
         grid.addWidget(self.date_to_edit, 1, 5)
 
@@ -1927,6 +2379,13 @@ class FinanceApp(QMainWindow):
         self.table.setColumnWidth(4, 200)  # 描述列宽一些
         self.table.setColumnWidth(9, 150)  # 标签列宽一些
 
+        # ★ v7.6 「看到哪一行」：滚动条一动就防抖写库（不打断滚动体验）
+        try:
+            self.table.verticalScrollBar().valueChanged.connect(
+                lambda _v: self._schedule_list_position_save())
+        except Exception as e:
+            print(f"[pagination] 接入滚动保存失败: {e}")
+
     def create_input_form(self):
         """创建输入表单"""
         form_layout = QHBoxLayout()
@@ -1953,16 +2412,25 @@ class FinanceApp(QMainWindow):
         self.account_combo = QComboBox()
         self.account_combo.addItem("全部结余", -1)
         self.load_account_combo()
-        self.account_combo.currentIndexChanged.connect(self.save_last_account)
+        # ★ v7.1 显式传 combo，不再依赖 self.sender()（间接调用时 sender() 为 None）
+        self.account_combo.currentIndexChanged.connect(
+            lambda _idx, _c=self.account_combo: self.save_last_account(_idx, _c))
         form_layout.addWidget(QLabel("账户:"))
         form_layout.addWidget(self.account_combo)
         
-        # 日期
+        # 日期 + 时间（★ v7.2 时间独立控件，date 列仍是纯 YYYY-MM-DD）
         self.date_edit = QDateEdit()
         self.date_edit.setDate(QDate.currentDate())
         self.date_edit.setCalendarPopup(True)
+        self.date_edit.setDisplayFormat("yyyy-MM-dd")
+        self.time_edit = QTimeEdit()
+        self.time_edit.setDisplayFormat("HH:mm:ss")
+        self.time_edit.setTime(QTime.currentTime())
+        _date_row = QHBoxLayout()
+        _date_row.addWidget(self.date_edit)
+        _date_row.addWidget(self.time_edit)
         form_layout.addWidget(QLabel("日期:"))
-        form_layout.addWidget(self.date_edit)
+        form_layout.addLayout(_date_row)
         
         # 描述
         self.desc_edit = QLineEdit()
@@ -2048,8 +2516,8 @@ class FinanceApp(QMainWindow):
 
 
     def toggle_recurring_fields(self, state):
-        """显示/隐藏定期交易相关字段"""
-        visible = state == Qt.Checked
+        """显示/隐藏定期交易相关字段（★ v6.0：stateChanged 发 int，必须用 qt_eq 比较）"""
+        visible = qt_eq(state, Qt.Checked)
         self.recurring_freq_combo.setVisible(visible)
         self.recurring_end_edit.setVisible(visible)
         
@@ -2152,13 +2620,28 @@ class FinanceApp(QMainWindow):
             pass
         
         # 连接信号
+        # ★ v6.0：PySide6 下对「没有连接」的信号调 disconnect() 会打印
+        #   RuntimeWarning: Failed to disconnect (None) from signal "currentTextChanged(QString)"
+        # （try/except 抛不住它，因为它是 Qt 的警告不是异常）。
+        # 所以改成「记住自己上次建的那个连接对象，只断开它」。
         try:
-            # 尝试断开现有连接
-            category_combo.currentTextChanged.disconnect()
-        except:
+            conns = getattr(self, "_category_combo_conns", None)
+            if conns is None:
+                conns = self._category_combo_conns = {}
+            old = conns.get(id(category_combo))
+            if old is not None:
+                category_combo.currentTextChanged.disconnect(old)
+        except Exception:
             pass
         # 重新连接信号
-        category_combo.currentTextChanged.connect(lambda: self.save_last_category(category_combo.currentText()))
+        try:
+            if not hasattr(self, "_category_combo_conns"):
+                self._category_combo_conns = {}
+            self._category_combo_conns[id(category_combo)] = \
+                category_combo.currentTextChanged.connect(
+                    lambda: self.save_last_category(category_combo.currentText()))
+        except Exception:
+            pass
         
         # 如果是支出或借款类型，默认选择"其他"
         if type_text in ["支出", "借款"] and "其他" in categories and not self.last_selections.get('category'):
@@ -2254,7 +2737,12 @@ class FinanceApp(QMainWindow):
         self.settle_button = QPushButton("标记为已结算")
         self.settle_button.clicked.connect(self.settle_record)
         button_layout.addWidget(self.settle_button)
-        
+
+        # ★ v6.7 一键批量还款
+        self.batch_repay_button = QPushButton("一键批量还款")
+        self.batch_repay_button.clicked.connect(self.show_batch_repay_dialog)
+        button_layout.addWidget(self.batch_repay_button)
+
         # 查看收据按钮
         self.view_receipt_btn = QPushButton("查看收据")
         self.view_receipt_btn.clicked.connect(self.view_receipt)
@@ -2274,6 +2762,8 @@ class FinanceApp(QMainWindow):
         
         # 处理待还款合计记录
         if type_text == "待还款合计":
+            # ★ v6.9（P2-6）：这条也是写库操作，以前没建撤销点，误加只能手删。
+            self.save_state_before_change()
             self.cursor.execute("""
                 SELECT SUM(t1.amount - IFNULL(t2.repaid, 0)) 
                 FROM transactions t1
@@ -2288,17 +2778,25 @@ class FinanceApp(QMainWindow):
             total_remaining = self.cursor.fetchone()[0] or 0
             
             # 添加待还款合计记录
+            # ★ v7.2：带上交易时间（主窗口日期旁边的时间控件）
+            _total_time = rec_time_from_qtime(getattr(self, 'time_edit', None).time()
+                                             if hasattr(self, 'time_edit') else None)
             self.cursor.execute('''
                 INSERT INTO transactions 
-                (type, amount, category, description, date)
-                VALUES (?, ?, ?, ?, ?)
+                (type, amount, category, description, date, rec_time)
+                VALUES (?, ?, ?, ?, ?, ?)
             ''', ('待还款合计', total_remaining, "借款统计", 
                 f"截至 {self.date_edit.date().toString('yyyy-MM-dd')} 的待还款合计",
-                self.date_edit.date().toString("yyyy-MM-dd")))
+                self.date_edit.date().toString("yyyy-MM-dd"), _total_time))
             
             self.conn.commit()
-            self.statusBar().showMessage(f"✅ 待还款合计记录已添加: {total_remaining:.2f} 元", 5000)
-            self.load_data()
+            # ★ v7.4：待还款合计也是写库操作，走统一刷新出口（以前只 load_data()）——
+            #   待还款合计虽然不计入流水净额，但它改变了「统计区待还款数字」与日期区间，
+            #   而且这里以前完全不重算账户/快照，只要写库路径漏刷新，后续任何一次
+            #   重算就会把今天看到的数字改掉（多算/少算全从这个缺口来）。
+            self.refresh_after_change(
+                self.date_edit.date().toString("yyyy-MM-dd"),
+                f"✅ 待还款合计记录已添加: {total_remaining:.2f} 元")
             self._scroll_table_to_bottom()      # ★ v4.9 添加后滚到底（设置开启时）
             return
             
@@ -2306,27 +2804,129 @@ class FinanceApp(QMainWindow):
         self.show_add_record_dialog()
 
 
-    def update_account_balance(self, account_id):
-        """更新账户余额"""
-        if not account_id:
-            return
-            
-        self.cursor.execute("""
-            SELECT 
-                SUM(CASE WHEN type='income' THEN amount ELSE 0 END) -
-                SUM(CASE WHEN type='expense' THEN amount ELSE 0 END) +
-                SUM(CASE WHEN type='还款' THEN amount ELSE 0 END) -
-                SUM(CASE WHEN type='借款' THEN amount ELSE 0 END)
-            FROM transactions
-            WHERE account_id=? AND type != 'balance'
-        """, (account_id,))
-        
-        balance = self.cursor.fetchone()[0] or 0
-        
-        self.cursor.execute("""
-            UPDATE accounts SET balance=? WHERE id=?
-        """, (balance, account_id))
+    # ============================================================
+    # ★ v6.9 余额口径统一（还款/结余审计修复）
+    #
+    #   账户余额 = 账户初始余额(accounts.initial_balance) + 该账户流水净额
+    #   流水净额 = income - expense + 还款 - 借款（排除 type='balance' 快照）
+    #
+    #   历史实现没有 initial_balance：新建账户时用户填的「初始余额」只被写进
+    #   accounts.balance 一次，下一次任何重算（update_account_balance /
+    #   calculate_and_update_balances）都会把 balance 覆盖成「流水净额」，
+    #   初始余额就此永久丢失 → 少计。v6.9 增加 initial_balance 列并把公式
+    #   统一到这里，所有入口只调用本组方法，不再各自拼 SQL。
+    # ============================================================
+    _NET_FLOW_SQL = """
+        SUM(CASE WHEN type='income' THEN amount ELSE 0 END) -
+        SUM(CASE WHEN type='expense' THEN amount ELSE 0 END) +
+        SUM(CASE WHEN type='还款' THEN amount ELSE 0 END) -
+        SUM(CASE WHEN type='借款' THEN amount ELSE 0 END)
+        FROM transactions
+    """
+
+    # ============================================================
+    # ★ v7.5 有效账户归属（EFF / effective account）
+    #
+    #   问题：一条「还款」记录自带 account_id，但它到底算哪个账户，
+    #   决定于它偿还的那笔「借款」属于哪个账户。历史版本（v6.9 以前）
+    #   的一键批量还款把 account_id 写成了 -1 / 空，于是同一条流水在
+    #   「按 account_id 汇总」的所有口径里被漏掉 ——
+    #     全库净额 0.00，而账户净额却是 -1016.46（少算 1016.46）。
+    #
+    #   用户 m03002 明确要求：原始登记数据（金额/日期/类型/account_id）
+    #   一律不许改，只让「计算」算对。所以这里不改数据，只统一口径：
+    #   凡按账户汇总，一律用本表达式取代裸 account_id。
+    #
+    #   EFF = 「还款」且有 related_id → 所属借款的 account_id；
+    #         其它情况            → 自身 account_id。
+    #
+    #   用法：self._eff_account()      → 不带别名的 transactions
+    #         self._eff_account("t")   → 主表别名 t
+    # ============================================================
+    _EFF_ACCOUNT_TPL = """(CASE WHEN {t}.type='还款' AND {t}.related_id IS NOT NULL
+            THEN IFNULL((SELECT l.account_id FROM transactions l
+                         WHERE l.id={t}.related_id AND l.type='借款'), {t}.account_id)
+            ELSE {t}.account_id END)"""
+
+    def _eff_account(self, alias="transactions"):
+        """有效账户归属表达式（v7.5）—— 见 _EFF_ACCOUNT_TPL 说明"""
+        return self._EFF_ACCOUNT_TPL.format(t=alias)
+
+    def _valid_account_id(self, account_id):
+        """账户ID是否可用（统一判断，避免 0 / None / -1 三种写法各判一次）"""
+        try:
+            return int(account_id) > 0
+        except (TypeError, ValueError):
+            return False
+
+    def _get_initial_balance(self, account_id):
+        """读取账户初始余额（老库无该列时返回 0）"""
+        if not self._valid_account_id(account_id):
+            return 0
+        self.cursor.execute(
+            "SELECT IFNULL(initial_balance, 0) FROM accounts WHERE id=?", (account_id,))
+        row = self.cursor.fetchone()
+        return row[0] if row else 0
+
+    def _calc_account_balance(self, account_id):
+        """只算不写：initial_balance + 流水净额；账户ID无效返回 None"""
+        if not self._valid_account_id(account_id):
+            return None
+        # ★ v7.5：按「有效账户归属」汇总（还款跟随所属借款的账户）
+        self.cursor.execute(
+            f"SELECT {self._NET_FLOW_SQL} WHERE {self._eff_account()} = ?"
+            f" AND type != 'balance'", (account_id,))
+        flow = self.cursor.fetchone()[0] or 0
+        return self._get_initial_balance(account_id) + flow
+
+    def _recalc_all_account_balances(self):
+        """把所有账户 balance 重算为 initial_balance + 流水净额（不建撤销点）"""
+        self.cursor.execute("SELECT id, IFNULL(initial_balance, 0) FROM accounts")
+        accounts = self.cursor.fetchall()
+        # ★ v7.5：口径改用有效账户归属（EFF），否则历史 -1 还款永远算不进账户
+        _eff = self._eff_account()
+        for account_id, initial in accounts:
+            self.cursor.execute(
+                f"SELECT {self._NET_FLOW_SQL} WHERE {_eff} = ? AND type != 'balance'",
+                (account_id,))
+            flow = self.cursor.fetchone()[0] or 0
+            self.cursor.execute(
+                "UPDATE accounts SET balance=? WHERE id=?", (initial + flow, account_id))
         self.conn.commit()
+
+    def update_account_balance(self, account_id):
+        """更新单个账户余额（= 初始余额 + 流水净额）"""
+        if not self._valid_account_id(account_id):
+            # ★ v6.9：以前这里静默 return，把「记到 -1 账户」这类错误彻底藏住了
+            print(f"[update_account_balance] 跳过无效账户ID: {account_id!r}")
+            return
+        balance = self._calc_account_balance(account_id)
+        self.cursor.execute(
+            "UPDATE accounts SET balance=? WHERE id=?", (balance, account_id))
+        self.conn.commit()
+
+    def refresh_after_change(self, from_date=None, message=None):
+        """任何写库操作之后的唯一刷新出口（★ v6.9）
+
+        以前每个入口各自拼刷新，漏一处就漏算（批量还款、调整超额、删定期交易、
+        撤销……全都中过）。现在统一走这里：
+          重算全部账户余额 → 重算余额快照 → 刷新账户表/主表/借款下拉/统计
+        """
+        try:
+            self._recalc_all_account_balances()
+            self.update_future_balances(from_date if from_date else "0000-01-01")
+            self.update_account_balances()
+            self.load_data()
+            self.update_loan_combo()
+            self.update_statistics()
+            if getattr(self, 'account_table', None) is not None:
+                self.load_account_table()
+        except Exception as e:
+            self.statusBar().showMessage(f"❌ 刷新余额失败: {str(e)}", 5000)
+            print(f"[refresh_after_change] {e}")
+            return
+        if message:
+            self.statusBar().showMessage(message, 5000)
 
     def delete_record(self):
         """删除选中的记录（支持多选）"""
@@ -2390,7 +2990,7 @@ class FinanceApp(QMainWindow):
         msg.setWindowTitle("确认删除")
         msg.setStandardButtons(QMessageBox.Ok | QMessageBox.Cancel)
         
-        if msg.exec_() != QMessageBox.Ok:
+        if msg.exec() != QMessageBox.Ok:
             return
         
         try:
@@ -2419,24 +3019,12 @@ class FinanceApp(QMainWindow):
             # 4. 更新所有关联借款的状态
             for loan_id in related_loans:
                 self.update_loan_status(loan_id)
-            
-            # 5. 更新账户余额
-            for account_id in account_ids:
-                self.update_account_balance(account_id)
-            
-            # 6. 更新后续日期的余额记录
-            if min_date:
-                self.update_future_balances(min_date)
-            
+
             # 提交事务
             self.conn.commit()
-            
-            # 更新UI
-            self.update_account_balances()
-            self.load_data()
-            self.update_statistics()
-            
-            self.statusBar().showMessage(f"✅ 已删除 {len(record_ids)} 条记录", 5000)
+
+            # 5. ★ v6.9 统一收尾：全量对账 + 刷新界面（不再逐账户手算）
+            self.refresh_after_change(min_date, f"✅ 已删除 {len(record_ids)} 条记录")
             
         except sqlite3.Error as e:
             self.conn.rollback()
@@ -2463,12 +3051,16 @@ class FinanceApp(QMainWindow):
         record_id = int(self.table.item(row, 0).text())
         
         # 获取记录详情（包含新增的remaining字段）
+        # ★ v7.2：末尾追加 rec_time（索引 14）—— 加在最后而不是中间，
+        #   是为了不打乱已有的 record[0..13] 下标（扩展名、状态、关联ID、剩余额
+        #   全按位置取的，插中间会全部错位）。
         self.cursor.execute("""
             SELECT type, amount, category, description, date, account_id, tags, 
                 receipt_image, is_recurring, recurring_freq, recurring_end, status, related_id,
                 (SELECT t.amount - IFNULL(SUM(r.amount), 0) 
                 FROM transactions r 
-                WHERE r.type='还款' AND r.related_id=t.id)
+                WHERE r.type='还款' AND r.related_id=t.id),
+                rec_time
                 FROM transactions t
                 WHERE id=?
         """, (record_id,))
@@ -2517,11 +3109,24 @@ class FinanceApp(QMainWindow):
         self.load_account_combo_to(account_combo)
         layout.addRow("账户:", account_combo)
         
-        # 日期
+        # 日期 + 时间（★ v7.2：时间单独一列，日期列仍是纯 YYYY-MM-DD）
         date_edit = QDateEdit(QDate.fromString(record[4], "yyyy-MM-dd"))
         date_edit.setCalendarPopup(True)
         date_edit.setDisplayFormat("yyyy-MM-dd")
-        layout.addRow("日期:", date_edit)
+        time_edit = QTimeEdit()
+        time_edit.setDisplayFormat("HH:mm:ss")
+        # ★ v7.3：老库里可能还残留 v7.2 的 10 位写法（16:31:0600），
+        #   先过 rec_time_normalize 裁成 8 位再解析，否则 QTime 解析失败回落 00:00。
+        _old_rec_time = rec_time_normalize(record[14]) if len(record) > 14 else REC_TIME_DEFAULT
+        _old_qtime = QTime.fromString(_old_rec_time or "", "HH:mm:ss")
+        if _old_qtime.isValid():
+            time_edit.setTime(_old_qtime)
+        else:
+            time_edit.setTime(QTime.fromString("00:00", "HH:mm"))
+        _date_row = QHBoxLayout()
+        _date_row.addWidget(date_edit)
+        _date_row.addWidget(time_edit)
+        layout.addRow("日期:", _date_row)
         
         # 描述
         desc_edit = QLineEdit(record[3])
@@ -2601,7 +3206,7 @@ class FinanceApp(QMainWindow):
         
         dialog.setLayout(layout)
         
-        if dialog.exec_() == QDialog.Accepted:
+        if dialog.exec() == QDialog.Accepted:
             # 获取修改后的值
             try:
                 amount = float(amount_edit.text())
@@ -2616,9 +3221,13 @@ class FinanceApp(QMainWindow):
             tags = tags_edit.text().strip()
             
             # 如果是还款记录，检查金额是否超过剩余应还金额
+            # ★ v6.9 P2-5：get_remaining_loan_amount 把「本条还款」也算进了已还，
+            #   导致把金额往上调（例如 100→150）时反而报「不能超过剩余 50」。
+            #   正确口径：剩余 + 本条原金额 = 不含本条时的可还上限。
             if current_type == '还款' and record[12]:
-                remaining = self.get_remaining_loan_amount(record[12])
-                if amount > remaining:
+                old_amount = float(record[1] or 0)
+                remaining = self.get_remaining_loan_amount(record[12]) + old_amount
+                if amount > remaining + 1e-6:
                     QMessageBox.warning(self, "错误", 
                         f"还款金额不能超过剩余应还金额 {remaining:.2f} 元")
                     return
@@ -2635,14 +3244,21 @@ class FinanceApp(QMainWindow):
             
             # 保存当前状态以便撤销
             self.save_state_before_change()
-            
-            # 更新记录
+
+            # ★ v6.9 P1-2：记住编辑前的账户与日期。
+            #   旧实现只对新 account_id 调 update_account_balance，
+            #   把记录从账户A改到账户B时，账户A的余额仍是旧值（多计/少计并存）。
+            old_account_id = record[5]
+            old_date = record[4]
+
+            # 更新记录（★ v7.2：同时写回交易时间）
             self.cursor.execute("""
                 UPDATE transactions 
                 SET amount=?, category=?, description=?, date=?, 
-                    account_id=?, tags=?
+                    account_id=?, tags=?, rec_time=?
                 WHERE id=?
-            """, (amount, category, description, date, account_id, tags, record_id))
+            """, (amount, category, description, date, account_id, tags,
+                   rec_time_from_qtime(time_edit.time()), record_id))
             
             # 如果编辑的是还款记录，更新关联借款状态
             if current_type == '还款' and record[12]:
@@ -2650,18 +3266,18 @@ class FinanceApp(QMainWindow):
             
             self.conn.commit()
             
-            # 更新账户余额
-            if account_id:
+            # ★ v6.9 P1-2/P1-3：新旧账户都重算（换账户时两边都变了），
+            #   并把余额快照的起点取「旧日期」与「新日期」中更早的一个 ——
+            #   以前这里判断 current_type in ["income","expense",...] 是拿中文
+            #   跟英文字面量比，永远不相等 → 编辑记录从不重算余额快照（漏算）。
+            self._recalc_all_account_balances()
+            if self._valid_account_id(old_account_id):
+                self.update_account_balance(old_account_id)
+            if self._valid_account_id(account_id):
                 self.update_account_balance(account_id)
-            
-            # 更新后续日期的余额记录
-            if current_type in ["income", "expense", "借款", "还款"]:
-                self.update_future_balances(date)
-            
-            self.update_account_balances()
-            self.statusBar().showMessage("✅ 记录已更新!", 5000)
-            self.load_data()
-            self.update_statistics()
+
+            from_date = min([d for d in (old_date, date) if d] or [date])
+            self.refresh_after_change(from_date, "✅ 记录已更新!")
 
 
     def update_loan_status(self, loan_id):
@@ -2725,10 +3341,11 @@ class FinanceApp(QMainWindow):
                     """, (loan_id,))
                     self.conn.commit()
                 
-                # 更新相关账户余额
+                # 更新相关账户余额（★ v6.9 P2-8：统一用 _valid_account_id，
+                # 以前用 if account_id: 判断，脏值 0/None 之外的写法各有各的漏洞）
                 self.cursor.execute("SELECT account_id FROM transactions WHERE id=?", (loan_id,))
                 account_id = self.cursor.fetchone()[0]
-                if account_id:
+                if self._valid_account_id(account_id):
                     self.update_account_balance(account_id)
                 
                 self.statusBar().showMessage(
@@ -2772,19 +3389,175 @@ class FinanceApp(QMainWindow):
             self.statusBar().showMessage("❌ 只能结算借款记录!", 5000)
             return
         
+        # ★ v6.9 P1-6：旧实现只 UPDATE status='settled'，不写还款记录。
+        #   紧接着 load_data 会遍历所有借款调用 update_loan_status，
+        #   而它按「已还款金额」重算 → remaining 仍 > 0 → 状态被改回 pending，
+        #   按钮 100% 自我失效。现在改成补一条真实还款记录（金额=剩余应还），
+        #   状态交给 update_loan_status 统一推导，账面上也真的平了。
+        remaining = self.get_remaining_loan_amount(record_id)
+        if remaining <= 0:
+            self.statusBar().showMessage("ℹ️ 该借款已无待还金额，无需结算", 5000)
+            self.update_loan_status(record_id)
+            self.refresh_after_change(None, "ℹ️ 该借款已结清")
+            return
+
         # 保存当前状态以便撤销
         self.save_state_before_change()
-        
-        # 标记为已结算
-        self.cursor.execute('''
-            UPDATE transactions SET status='settled' WHERE id=?
-        ''', (record_id,))
-        self.conn.commit()
-        
-        self.statusBar().showMessage("✅ 借款记录已标记为已结清!", 5000)
-        self.load_data()
-        self.update_loan_combo()
-        self.update_statistics()
+
+        today = QDate.currentDate().toString("yyyy-MM-dd")
+        loan_account_id = self.get_account_id_for_loan(record_id)
+        if not self._valid_account_id(loan_account_id):
+            loan_account_id = None
+
+        # 还款分类：与单笔/批量还款一致
+        self.cursor.execute("SELECT name FROM categories WHERE type='income' ORDER BY name")
+        income_cats = [r[0] for r in self.cursor.fetchall()]
+        category = "其他" if "其他" in income_cats else (income_cats[0] if income_cats else "其他")
+
+        try:
+            # ★ v7.2：结算补记的还款用「当前时刻」作交易时间
+            self.cursor.execute('''
+                INSERT INTO transactions
+                (type, amount, category, description, date, related_id, account_id, tags,
+                 receipt_image, is_recurring, recurring_freq, recurring_end, rec_time)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', ('还款', remaining, category, "标记已结清", today, record_id, loan_account_id, "",
+                 None, 0, None, None, rec_time_now()))
+            self.conn.commit()
+        except Exception as e:
+            self.conn.rollback()
+            self.statusBar().showMessage(f"❌ 结算失败: {str(e)}", 5000)
+            print(f"[settle_record] {e}")
+            return
+
+        self.update_loan_status(record_id)
+        self.refresh_after_change(today, "✅ 借款记录已标记为已结清!")
+
+    # ★ v6.7 一键批量还款：弹窗勾选（全选/多选）待还款借款，确认后逐笔自动还清
+    def show_batch_repay_dialog(self):
+        """打开「一键批量还款」弹窗，列出所有待还款借款，可全选/多选后确定。"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("一键批量还款")
+        dialog.setMinimumWidth(420)
+        layout = QVBoxLayout(dialog)
+
+        tip = QLabel("勾选要还款的借款（默认按剩余金额还清，并标记为已结算）：")
+        layout.addWidget(tip)
+
+        list_widget = QListWidget()
+        list_widget.setSelectionMode(QListWidget.MultiSelection)
+
+        # 查询所有待还款借款（type='借款' AND status='pending'），展示 剩余金额
+        self.cursor.execute("""
+            SELECT id, amount, description, date
+            FROM transactions
+            WHERE type='借款' AND status='pending'
+            ORDER BY date
+        """)
+        loans = self.cursor.fetchall()
+        if not loans:
+            list_widget.addItem("（无可还款的借款）")
+            list_widget.setEnabled(False)
+        else:
+            for loan in loans:
+                loan_id, amount, description, date = loan
+                remaining = self.get_remaining_loan_amount(loan_id)
+                item = QListWidgetItem(
+                    f"ID:{loan_id}  借款:{amount:.2f}  剩余:{remaining:.2f}  "
+                    f"日期:{date}  描述:{description or ''}"
+                )
+                item.setData(Qt.UserRole, loan_id)
+                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+                item.setCheckState(Qt.Unchecked)
+                list_widget.addItem(item)
+
+        layout.addWidget(list_widget)
+
+        # 全选 / 全不选
+        sel_row = QHBoxLayout()
+        select_all_btn = QPushButton("全选")
+        select_none_btn = QPushButton("全不选")
+        sel_row.addWidget(select_all_btn)
+        sel_row.addWidget(select_none_btn)
+        sel_row.addStretch(1)
+        layout.addLayout(sel_row)
+
+        def _set_all(state):
+            for i in range(list_widget.count()):
+                it = list_widget.item(i)
+                if it.flags() & Qt.ItemIsEnabled:
+                    it.setCheckState(state)
+
+        select_all_btn.clicked.connect(lambda: _set_all(Qt.Checked))
+        select_none_btn.clicked.connect(lambda: _set_all(Qt.Unchecked))
+
+        # 确定 / 取消
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        ok_btn = QPushButton("确定")
+        cancel_btn = QPushButton("取消")
+        btn_row.addWidget(ok_btn)
+        btn_row.addWidget(cancel_btn)
+        layout.addLayout(btn_row)
+
+        cancel_btn.clicked.connect(dialog.reject)
+        ok_btn.clicked.connect(lambda: self.do_batch_repay(dialog, list_widget))
+        dialog.exec()
+
+    def do_batch_repay(self, dialog, list_widget):
+        """一键批量还款：对勾选的每笔借款，按剩余金额插入还款记录并标记已结算。"""
+        selected_ids = []
+        for i in range(list_widget.count()):
+            it = list_widget.item(i)
+            if it.data(Qt.UserRole) is not None and qt_eq(it.checkState(), Qt.Checked):
+                selected_ids.append(it.data(Qt.UserRole))
+
+        if not selected_ids:
+            QMessageBox.information(dialog, "一键批量还款", "请先勾选要还款的借款。")
+            return
+
+        # 保存当前状态以便撤销
+        self.save_state_before_change()
+
+        today = QDate.currentDate().toString("yyyy-MM-dd")
+        # ★ v6.9 P0-1：以前这里硬编码 account_id = -1（「全部结余」这个并不存在的账户），
+        #   导致借款本金扣在账户A、还款抵冲却记到 -1，账户A永久偏负且刷新不回来。
+        #   现在按每笔借款自己的 account_id 记账（与单笔一键还款口径一致）。
+        # 还款默认分类：优先“其他”，否则取第一个收入类分类（与单笔还款弹窗一致）
+        self.cursor.execute("SELECT name FROM categories WHERE type='income' ORDER BY name")
+        income_cats = [r[0] for r in self.cursor.fetchall()]
+        category = "其他" if "其他" in income_cats else (income_cats[0] if income_cats else "其他")
+        count = 0
+        try:
+            for loan_id in selected_ids:
+                remaining = self.get_remaining_loan_amount(loan_id)
+                if remaining <= 0:
+                    continue
+                # ★ v6.9 P0-1：还款记到「该笔借款所在的账户」
+                account_id = self.get_account_id_for_loan(loan_id)
+                if not self._valid_account_id(account_id):
+                    account_id = None  # 借款本身没记账户时保持一致，不要伪造 -1
+                # 插入还款记录（金额=剩余金额，关联借款）
+                self.cursor.execute('''
+                    INSERT INTO transactions
+                    (type, amount, category, description, date, related_id, account_id, tags,
+                     receipt_image, is_recurring, recurring_freq, recurring_end, rec_time)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', ('还款', remaining, category, "一键批量还款", today, loan_id, account_id, "",
+                     None, 0, None, None, rec_time_now()))
+                # 借款状态交给唯一的状态机处理（不直接写 status）
+                self.update_loan_status(loan_id)
+                count += 1
+            self.conn.commit()
+        except Exception as e:
+            self.conn.rollback()
+            self.statusBar().showMessage(f"❌ 批量还款失败: {str(e)}", 5000)
+            return
+
+        dialog.accept()
+        # ★ v6.9 P0-2：以前只 load_data/update_loan_combo/update_statistics，
+        #   账户余额与余额快照全都没重算 → 批量还款后「账号结余」整体漏记。
+        self.refresh_after_change(today, f"✅ 已批量还款 {count} 笔借款!")
 
     def view_receipt(self):
         """查看收据图片"""
@@ -2834,20 +3607,34 @@ class FinanceApp(QMainWindow):
         filter_status = self.filter_status_combo.currentText()
         
         # 构建基础查询
-        query = """
+        # ★ v7.5：列表的「账户」列改看「有效账户归属」——
+        #   还款的账户 = 它偿还的那笔借款的账户（不是自己身上的 account_id）。
+        #   不改任何登记数据，只改展示/筛选口径：以前 34 笔历史一键还款挂在
+        #   -1，按账户筛选时一条都看不见，导出时账户列还是空的。
+        _eff_t = self._eff_account("t")
+        query = f"""
             SELECT t.id, t.type, t.amount, t.category, t.description, t.date, 
                 CASE WHEN t.status IS NULL THEN '' ELSE t.status END,
                 CASE WHEN t.related_id IS NULL THEN '' ELSE t.related_id END,
-                a.name, t.tags,
+                (SELECT a2.name FROM accounts a2 WHERE a2.id = {_eff_t}) AS acc_name,
+                t.tags,
                 CASE WHEN t.type='借款' THEN 
                     (SELECT t.amount - IFNULL(SUM(r.amount), 0) 
                     FROM transactions r 
                     WHERE r.type='还款' AND r.related_id=t.id)
                     ELSE NULL
-                END as remaining
+                END as remaining,
+                t.account_id,
+                t.rec_time,
+                {_eff_t} AS eff_account_id
             FROM transactions t
-            LEFT JOIN accounts a ON t.account_id = a.id
         """
+        # ★ v6.9 P1-1：追加第 12 列 t.account_id（索引 11），供表格 UserRole 使用。
+        #   以前 UserRole 存的是「筛选下拉框里账户名的位置」：
+        #     · 下拉框选中「所有账户」或该账户不在下拉里 → findText 返回 -1；
+        #     · 返回 -1 后 if account_item.data(Qt.UserRole) 判真 → 去更新 -1 账户；
+        #     · 下拉框索引与真实 account_id 根本不是一回事 → 删记录时更新错账户。
+        #   现在表格携带真实 account_id，删/改都能定位正确账户。
         
         # 构建WHERE条件
         conditions = []
@@ -2876,9 +3663,9 @@ class FinanceApp(QMainWindow):
             conditions.append("t.category=?")
             params.append(filter_category)
         
-        # 账户筛选
+        # 账户筛选（★ v7.5：按有效账户归属筛，还款跟随所属借款的账户）
         if filter_account:
-            conditions.append("t.account_id=?")
+            conditions.append(f"{self._eff_account('t')}=?")
             params.append(filter_account)
         
         # 状态筛选
@@ -2910,7 +3697,12 @@ class FinanceApp(QMainWindow):
             search_params.append(f"%{search_text}%")
             
             # 5. 匹配账户名
-            search_conditions.append("a.name LIKE ?")
+            # ★ v7.6 修：v7.5 把主查询的 LEFT JOIN 换成标量子查询后，
+            #   这里还留着 "a.name LIKE ?"，一旦用户输入搜索词就会抛
+            #   sqlite3.OperationalError: no such column: a.name（列表直接空掉）。
+            #   改成同样的「有效账户归属」标量子查询，口径与「账户」列一致。
+            search_conditions.append(
+                f"(SELECT a2.name FROM accounts a2 WHERE a2.id = {_eff_t}) LIKE ?")
             search_params.append(f"%{search_text}%")
             
             # 6. 拼音首字母匹配
@@ -2957,15 +3749,216 @@ class FinanceApp(QMainWindow):
             query += " WHERE " + " AND ".join(conditions)
         
         # 排序
-        query += " ORDER BY t.date ASC, t.id ASC"
+        # ★ v7.2：同一天内按交易时间排序（秒级）；rec_time 为空的极老库回落到 id
+        query += " ORDER BY t.date ASC, IFNULL(t.rec_time,'00:00:00') ASC, t.id ASC"
         
         # 执行查询
         self.cursor.execute(query, params)
         records = self.cursor.fetchall()
-        
-        # 更新表格
-        self.table.setRowCount(len(records))
-        for row, record in enumerate(records):
+
+        # ★ v7.6 分页（纯显示层）：
+        #   SQL 依旧**全量取回**，分页只决定「这一屏画哪几行」。
+        #   余额、账户结余、统计图表、导出、待还款合计、快照重算走的都是
+        #   数据库里的全量数据，完全不看这里的分页状态 —— 所以分页绝不会
+        #   影响任何计算结果，也不可能造成多算/少算/漏算。
+        self._all_records = records
+        self._render_page(records)
+        return
+
+    # ============================================================
+    # ★ v7.6 列表分页 + 时间显示开关（纯显示层）
+    # ============================================================
+    def _effective_page_size(self):
+        """当前每页行数（异常/越界一律回落到默认 100 行）"""
+        try:
+            size = int(self.page_size)
+        except (TypeError, ValueError):
+            size = 100
+        if size <= 0:
+            size = 100
+        return size
+
+    def _create_pagination_bar(self):
+        """创建分页条（放在交易表格下方，★ v7.6）"""
+        bar = QHBoxLayout()
+        bar.setContentsMargins(0, 0, 0, 0)
+        bar.setSpacing(6)
+
+        self.btn_first_page = QPushButton("⏮ 首页")
+        self.btn_prev_page = QPushButton("◀ 上一页")
+        self.btn_next_page = QPushButton("下一页 ▶")
+        self.btn_last_page = QPushButton("末页 ⏭")
+        for _b in (self.btn_first_page, self.btn_prev_page,
+                   self.btn_next_page, self.btn_last_page):
+            _b.setFixedWidth(88)
+            bar.addWidget(_b)
+
+        self.lbl_page_info = QLabel("第 1 / 1 页（共 0 条）")
+        self.lbl_page_info.setStyleSheet("color: #333333;")
+        bar.addWidget(self.lbl_page_info)
+
+        bar.addStretch(1)
+
+        bar.addWidget(QLabel("每页行数:"))
+        self.page_size_combo = QComboBox()
+        for _n in self.PAGE_SIZE_CHOICES:
+            self.page_size_combo.addItem(str(_n), _n)
+        self.page_size_combo.setFixedWidth(80)
+        bar.addWidget(self.page_size_combo)
+
+        self.btn_first_page.clicked.connect(lambda: self._goto_page(0))
+        self.btn_prev_page.clicked.connect(lambda: self._goto_page(self._page_index - 1))
+        self.btn_next_page.clicked.connect(lambda: self._goto_page(self._page_index + 1))
+        self.btn_last_page.clicked.connect(lambda: self._goto_page(10 ** 9))
+        self.page_size_combo.currentIndexChanged.connect(self._on_page_size_changed)
+
+        # 记忆「看到哪一行」：滚动条一动就防抖写库（不打断滚动）
+        # 只建一次：reset_ui() 重建界面时会再进来，重复建会留下多个定时器
+        if self.__dict__.get('_page_save_timer') is None:
+            self._page_save_timer = QTimer(self)
+            self._page_save_timer.setSingleShot(True)
+            self._page_save_timer.setInterval(800)
+            self._page_save_timer.timeout.connect(self._save_list_position)
+
+        return bar
+
+    def _update_pagination_bar(self, total, pages, index, size):
+        """刷新分页条文字与按钮可用状态"""
+        # 分页条没建（例如只构造了表格的测试实例）时静默跳过
+        if getattr(self, 'lbl_page_info', None) is None:
+            return
+        try:
+            self._sync_page_size_combo(size)
+            shown_from = index * size + 1 if total else 0
+            shown_to = min(total, (index + 1) * size)
+            self.lbl_page_info.setText(
+                f"第 {index + 1} / {pages} 页（共 {total} 条，本页 {shown_from}-{shown_to} 条）")
+            self.btn_first_page.setEnabled(index > 0)
+            self.btn_prev_page.setEnabled(index > 0)
+            self.btn_next_page.setEnabled(index < pages - 1)
+            self.btn_last_page.setEnabled(index < pages - 1)
+        except Exception as e:
+            print(f"[pagination] 刷新分页条失败: {e}")
+
+    def _sync_page_size_combo(self, size=None):
+        """让分页条上的「每页行数」下拉框与当前实际行数保持一致（★ v7.6）
+
+        下拉框的默认停在第一项（20 行），而实际默认是 100 行；不主动同步的话
+        界面会显示「每页显示 20 行」但表格里是 100 行，改选 20 又因为
+        索引没变而不触发信号 —— 用户会以为「设置没生效」。
+        """
+        combo = getattr(self, 'page_size_combo', None)
+        if combo is None:
+            return
+        try:
+            size = int(size if size is not None else self._effective_page_size())
+        except (TypeError, ValueError):
+            return
+        idx = combo.findData(size)
+        if idx < 0:
+            return
+        if combo.currentIndex() != idx:
+            combo.blockSignals(True)
+            combo.setCurrentIndex(idx)
+            combo.blockSignals(False)
+
+    def _goto_page(self, index):
+        """跳到第 index 页（越界自动夹紧；只重绘，不重新查库）"""
+        records = self._all_records or []
+        size = self._effective_page_size()
+        pages = max(1, (len(records) + size - 1) // size)
+        try:
+            index = int(index)
+        except (TypeError, ValueError):
+            index = 0
+        index = max(0, min(index, pages - 1))
+        self._page_index = index
+        self._restore_scroll_pending = False
+        self._render_page(records)
+
+    def _on_page_size_changed(self, _index=None):
+        """每页行数改了：实时落库 + 保持「当前看到的那一行」大致不动"""
+        size = self._effective_page_size_from_combo()
+        old_anchor = self._page_start_index
+        self.page_size = size
+        self._page_index = old_anchor // size if size else 0
+        self._restore_scroll_pending = False
+        self._render_page(self._all_records or [])
+        try:
+            self._settings_write('page_size', size)
+        except Exception as e:
+            print(f"[pagination] 保存每页行数失败: {e}")
+        self.statusBar().showMessage(f"设置已保存：每页 {size} 行", 3000)
+
+    def _effective_page_size_from_combo(self):
+        """从下拉框读每页行数（拿不到就用当前值）"""
+        combo = getattr(self, 'page_size_combo', None)
+        if combo is not None:
+            data = combo.currentData()
+            if data:
+                try:
+                    return int(data)
+                except (TypeError, ValueError):
+                    pass
+        return self._effective_page_size()
+
+    def _on_filter_changed(self, *args):
+        """筛选条件变了：回到第 1 页再筛选（★ v7.6）
+
+        分页后如果还停在第 5 页去筛选，结果只剩 3 条时会显示空白页、
+        看起来像「一条都没查到」，所以任何筛选变化都先回到第一页。
+        """
+        # ★ v7.6 恢复设置期间（load_settings 里 date_range 会触发日期控件变化）
+        #   绝不能把「上次看到的页」重置成第 1 页 —— 那正是「记住看到哪一行」失效的原因。
+        if not self._settings_restoring:
+            self._page_index = 0
+            self._restore_scroll_pending = False
+        self.apply_filters()
+
+    def _save_list_position(self):
+        """把「当前页锚点 + 页内滚动位置」实时写库（★ v7.6 记忆看到哪一行）"""
+        try:
+            anchor = int(self._page_start_index)
+            scroll = 0
+            table = getattr(self, 'table', None)
+            if table is not None:
+                scroll = int(table.verticalScrollBar().value())
+            self._settings_write('list_anchor', anchor)
+            self._settings_write('list_scroll', scroll)
+        except Exception as e:
+            print(f"[pagination] 保存列表位置失败: {e}")
+
+    def _schedule_list_position_save(self):
+        """滚动/翻页后防抖保存位置（避免每滚一像素就写库）"""
+        timer = self.__dict__.get('_page_save_timer')
+        if timer is not None:
+            timer.start()
+
+    def _render_page(self, records=None):
+        """把「当前页」画进表格（★ v7.6）
+
+        records 传全量记录；不传则用上次筛出的全量结果。
+        绘制逻辑与 v7.5 完全一致，唯一区别是只画 [start:start+size] 这一段。
+        """
+        if records is None:
+            records = self._all_records or []
+        total = len(records)
+        size = self._effective_page_size()
+        pages = max(1, (total + size - 1) // size)
+        index = self._page_index
+        if index < 0:
+            index = 0
+        if index >= pages:
+            index = pages - 1
+        self._page_index = index
+        start = index * size
+        self._page_start_index = start
+        page_records = records[start:start + size]
+
+        # 更新表格（只有本页这么多行）
+        self.table.setRowCount(len(page_records))
+        # ★ v7.6：只画本页的记录（records 是全量，page_records 是本页切片）
+        for row, record in enumerate(page_records):
             for col, value in enumerate(record):
                 item = QTableWidgetItem(str(value) if value is not None else "")
                 item.setTextAlignment(Qt.AlignCenter)
@@ -3023,10 +4016,37 @@ class FinanceApp(QMainWindow):
                         item.setText(str(value))
                     item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 
-                # 账户列存储账户ID
-                if col == 8 and record[8]:
-                    item.setData(Qt.UserRole, self.filter_account_combo.findText(record[8]))
-                
+                # ★ v7.2 日期列显示成「2026-11-21 16:31:0600」
+                #   （查询里 t.date 仍是纯日期，rec_time 是末尾第 13 列 = 索引 12）
+                if col == 5:
+                    _rec_time_val = record[12] if len(record) > 12 else None
+                    # ★ v7.6 「是否显示时间」开关：关掉时只显示纯日期，
+                    #   方便直接截图；数据库里的 rec_time 一个字都不动，
+                    #   打开开关立刻原样恢复时分秒。
+                    if self.show_time_in_list:
+                        item.setText(format_rec_datetime(value, _rec_time_val))
+                    else:
+                        item.setText(str(value) if value is not None else "")
+
+                # 账户列存储账户ID（★ v6.9 P1-1：存真实 account_id，不再存下拉框索引）
+                # ★ v7.5：优先存「有效账户归属」（索引 13）—— 还款归属到它偿还的
+                #   那笔借款的账户，免得删/改时按 -1 去找一个不存在的账户。
+                if col == 8:
+                    if len(record) > 13 and record[13] is not None:
+                        real_account_id = record[13]
+                    else:
+                        real_account_id = record[11] if len(record) > 11 else None
+                    item.setData(Qt.UserRole, real_account_id)
+
+                # ★ v6.1：查询结果比表格**多一列** —— 第 11 列（remaining）只用于上面
+                # 把「借款」显示成「借款 (剩余:…)」，表格里并没有这一列（setColumnCount(10)）。
+                # 列号越界时不能再调 setItem：Qt6（6.11 实测）会在 QTableWidget::setItem 里
+                # 发一次无效范围的 dataChanged，控制台就会刷
+                #   dataChanged() called with an invalid index range: …QModelIndex(-1,-1…)
+                # （Qt5 是静默忽略的，所以迁移到 PySide6 后才冒出来）。
+                if col >= self.table.columnCount():
+                    continue
+
                 self.table.setItem(row, col, item)
         
         # 如果有选中的行，启用查看收据按钮
@@ -3041,8 +4061,34 @@ class FinanceApp(QMainWindow):
                 self.view_receipt_btn.setEnabled(bool(receipt_data))
             else:
                 self.view_receipt_btn.setEnabled(False)
-        
+
         self.table.resizeColumnsToContents()
+
+        # ★ v7.6 分页条文字/按钮状态 + 「看到哪一行」恢复
+        self._update_pagination_bar(total, pages, index, size)
+        self._restore_scroll_position()
+        self._schedule_list_position_save()
+
+    def _restore_scroll_position(self):
+        """启动恢复：滚到上次看到的那一行（★ v7.6）
+
+        只在启动后第一次绘制时生效（_restore_scroll_pending），
+        之后的筛选/翻页不再抢用户的滚动位置。
+        """
+        if not self._restore_scroll_pending:
+            return
+        self._restore_scroll_pending = False
+        table = getattr(self, 'table', None)
+        if table is None:
+            return
+        try:
+            scroll = int(getattr(self, '_restore_scroll_value', 0) or 0)
+            if scroll > 0:
+                table.verticalScrollBar().setValue(scroll)
+            else:
+                table.scrollToTop()
+        except Exception as e:
+            print(f"[pagination] 恢复滚动位置失败: {e}")
 
     def get_pinyin_abbr(self, text):
         """获取中文文本的拼音首字母缩写"""
@@ -3449,7 +4495,7 @@ class FinanceApp(QMainWindow):
                 "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
                 ('last_user', self.current_user)
             )
-            self.master_conn.commit()
+            self.commit_master()
         
         self.close_current_db()
         self.show_login_dialog()
@@ -3470,7 +4516,9 @@ class FinanceApp(QMainWindow):
                 db_name = f'finance_{self.current_user}.db'
                 with open(db_name, 'wb') as f:
                     # 获取所有数据
-                    temp_conn = sqlite3.connect(':memory:')
+                    # ★ v6.9 P0-3：以前这里新建一个空的内存库来读 schema，导出结果恒为空
+                    #   （撤销会清库、加密备份是空壳）。改为直接从当前连接导出。
+                    temp_conn = self.conn
                     temp_cursor = temp_conn.cursor()
                     
                     # 获取所有数据
@@ -3491,7 +4539,7 @@ class FinanceApp(QMainWindow):
                             values = ", ".join([f"'{str(v)}'" if v is not None else "NULL" for v in row])
                             data_dump.append(f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({values});")
                     
-                    temp_conn.close()
+                    # 注意：temp_conn 就是 self.conn，绝不能 close
                     
                     # 合并模式和数据进行加密
                     full_dump = schema + "\n" + "\n".join(data_dump)
@@ -3507,6 +4555,8 @@ class FinanceApp(QMainWindow):
             print(f"自动备份成功: {backup_file}")
         else:
             print("自动备份失败")
+        # ★ v6.8 顺带对主库 / launcher 做变化即备份
+        self.auto_backup_external()
 
     def setup_auto_backup_timer(self, interval_hours=1):
         """设置自动备份定时器"""
@@ -3578,9 +4628,9 @@ class FinanceApp(QMainWindow):
                         self.conn = sqlite3.connect(f'finance_{self.current_user}.db')
                     
                     self.cursor = self.conn.cursor()
-                    self.load_data()
-                    self.update_statistics()
-                    self.statusBar().showMessage("✅ 数据恢复成功!", 5000)
+                    # ★ v7.4：从备份恢复的是整库快照 —— accounts.balance 与「余额统计」
+                    #   都是备份当时的旧数字，若不重算就与当前流水脱节（漏算）。
+                    self.refresh_after_change(None, "✅ 数据恢复成功!")
                 except Exception as e:
                     self.statusBar().showMessage(f"❌ 恢复失败: {str(e)}", 5000)
                     self.conn = sqlite3.connect(f'finance_{self.current_user}.db')
@@ -3728,7 +4778,7 @@ class FinanceApp(QMainWindow):
         layout.addWidget(button_box)
         
         dialog.setLayout(layout)
-        dialog.exec_()
+        dialog.exec()
 
     def filter_backup_table(self, table, backups, filter_type, date_from, date_to):
         """筛选备份表格"""
@@ -3826,7 +4876,9 @@ class FinanceApp(QMainWindow):
             # 导出内存数据库
             with open(backup_file, 'wb') as f:
                 # 获取所有数据
-                temp_conn = sqlite3.connect(':memory:')
+                # ★ v6.9 P0-3：此处原为空内存库导出（full_dump 恒为 "\n"），
+                #   撤销时 executescript("") 等于清空数据库。改为直接导出当前连接。
+                temp_conn = self.conn
                 temp_cursor = temp_conn.cursor()
                 
                 # 获取所有数据
@@ -3847,7 +4899,7 @@ class FinanceApp(QMainWindow):
                         values = ", ".join([f"'{str(v)}'" if v is not None else "NULL" for v in row])
                         data_dump.append(f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({values});")
                 
-                temp_conn.close()
+                # 注意：temp_conn 就是 self.conn，绝不能 close
                 
                 # 合并模式和数据进行加密
                 full_dump = schema + "\n" + "\n".join(data_dump)
@@ -3883,9 +4935,10 @@ class FinanceApp(QMainWindow):
                 self.conn = sqlite3.connect(f'finance_{self.current_user}.db')
             
             self.cursor = self.conn.cursor()
-            self.load_data()
-            self.update_statistics()
-            self.statusBar().showMessage("✅ 已撤销最后一次操作!", 5000)
+            # ★ v6.9 P2-7：撤销本质是把整库换成了旧快照，
+            #   账户余额/余额快照必须按恢复后的数据重算一遍，
+            #   否则界面上还挂着撤销前算出来的结余（多计或少计）。
+            self.refresh_after_change(None, "✅ 已撤销最后一次操作!")
             
             # 删除临时文件
             os.remove(backup_file)
@@ -3937,7 +4990,7 @@ class FinanceApp(QMainWindow):
         
         layout.addLayout(button_layout)
         dialog.setLayout(layout)
-        dialog.exec_()
+        dialog.exec()
         
         # 更新分类下拉框
         self.load_categories()
@@ -4055,7 +5108,7 @@ class FinanceApp(QMainWindow):
         
         layout.addLayout(button_layout)
         dialog.setLayout(layout)
-        dialog.exec_()
+        dialog.exec()
         
         # 更新账户下拉框
         self.load_accounts()
@@ -4116,7 +5169,7 @@ class FinanceApp(QMainWindow):
         
         dialog.setLayout(layout)
         
-        if dialog.exec_() == QDialog.Accepted:
+        if dialog.exec() == QDialog.Accepted:
             name = name_edit.text().strip()
             balance = balance_edit.text().strip()
             currency = currency_combo.currentText()
@@ -4133,14 +5186,18 @@ class FinanceApp(QMainWindow):
                 return
                 
             try:
+                # ★ v6.9（P1-5）：用户填的「初始余额」必须落到 initial_balance，
+                #   而不是只写一次 balance 就被后续重算覆盖掉（少计）。
                 self.cursor.execute("""
-                    INSERT INTO accounts (name, balance, currency, description)
-                    VALUES (?, ?, ?, ?)
-                """, (name, balance, currency, desc))
+                    INSERT INTO accounts (name, balance, currency, description, initial_balance)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (name, balance, currency, desc, balance))
                 self.conn.commit()
                 
-                self.statusBar().showMessage("✅ 账户已添加!", 5000)
-                self.load_account_table()
+                # ★ v7.4：新增账户会改变 SUM(initial_balance) —— 所有「余额统计」
+                #   快照都要跟着重算。以前只 load_account_table()，账户表数字变了，
+                #   但主表里的余额快照还停在旧的总额上（多算/少算就是这么来的）。
+                self.refresh_after_change(None, "✅ 账户已添加!")
             except sqlite3.IntegrityError:
                 self.statusBar().showMessage("❌ 账户名已存在!", 5000)
 
@@ -4198,7 +5255,7 @@ class FinanceApp(QMainWindow):
         
         edit_dialog.setLayout(layout)
         
-        if edit_dialog.exec_() == QDialog.Accepted:
+        if edit_dialog.exec() == QDialog.Accepted:
             new_name = name_edit.text().strip()
             new_balance = balance_edit.text().strip()
             new_currency = currency_combo.currentText()
@@ -4215,15 +5272,19 @@ class FinanceApp(QMainWindow):
                 return
                 
             try:
+                # ★ v6.9（P1-5）：把「初始余额」直接当 accounts.balance 写，下一次任何
+                #   重算都会用流水净额把它打回去（用户以为改了、实际很快被改回）。
+                #   现在改的是 initial_balance，余额再由 初始余额+流水净额 重新算出。
                 self.cursor.execute("""
                     UPDATE accounts 
-                    SET name=?, balance=?, currency=?, description=?
+                    SET name=?, currency=?, description=?, initial_balance=?
                     WHERE id=?
-                """, (new_name, new_balance, new_currency, new_desc, account_id))
+                """, (new_name, new_currency, new_desc, new_balance, account_id))
                 self.conn.commit()
-                
-                self.statusBar().showMessage("✅ 账户已更新!", 5000)
-                self.load_account_table()
+
+                # ★ v7.4：改的是 initial_balance —— 只重算本账户不够，历史「余额统计」
+                #   快照是按全库 SUM(initial_balance) 算的，必须整体重算一遍。
+                self.refresh_after_change(None, "✅ 账户已更新!")
             except sqlite3.IntegrityError:
                 self.statusBar().showMessage("❌ 账户名已存在!", 5000)
 
@@ -4239,9 +5300,12 @@ class FinanceApp(QMainWindow):
         account_name = self.account_table.item(row, 1).text()
         
         # 检查是否有交易关联此账户
-        self.cursor.execute("""
-            SELECT COUNT(*) FROM transactions 
-            WHERE account_id=?
+        # ★ v7.5：按「有效账户归属」查 —— 以前只数 account_id，于是
+        #   「还款记在别的账户、但它偿还的是本账户的借款」这类记录被漏掉，
+        #   账户删掉后那些还款就成了找不到账户的孤儿。
+        self.cursor.execute(f"""
+            SELECT COUNT(*) FROM transactions
+            WHERE {self._eff_account()} = ?
         """, (account_id,))
         count = self.cursor.fetchone()[0]
         
@@ -4263,8 +5327,8 @@ class FinanceApp(QMainWindow):
             """, (account_id,))
             self.conn.commit()
             
-            self.statusBar().showMessage("✅ 账户已删除!", 5000)
-            self.load_account_table()
+            # ★ v7.4：删账户同样改变 SUM(initial_balance)，必须重算快照与统计
+            self.refresh_after_change(None, "✅ 账户已删除!")
 
     def manage_budgets(self):
         """管理预算"""
@@ -4326,7 +5390,7 @@ class FinanceApp(QMainWindow):
         
         layout.addLayout(button_layout)
         dialog.setLayout(layout)
-        dialog.exec_()
+        dialog.exec()
         
         # 刷新统计
         self.update_statistics()
@@ -4533,13 +5597,15 @@ class FinanceApp(QMainWindow):
         
         layout.addLayout(button_layout)
         dialog.setLayout(layout)
-        dialog.exec_()
+        dialog.exec()
 
     def load_recurring_transactions(self):
         """加载定期交易"""
+        # ★ v6.9（P2-3）：多取一列 recurring_next_date（第 8 列，索引 7），
+        #   它才是「下次执行日」；date 是模板的原始锚点，不再被改写。
         self.cursor.execute("""
             SELECT id, type, amount, category, recurring_freq, 
-                   date, recurring_end
+                   date, recurring_end, recurring_next_date
             FROM transactions
             WHERE is_recurring=1
             ORDER BY date
@@ -4549,6 +5615,9 @@ class FinanceApp(QMainWindow):
         self.recurring_table.setRowCount(len(transactions))
         for row, trans in enumerate(transactions):
             for col, value in enumerate(trans):
+                # 第 8 列只说给「下次执行」用，不单独占一栏
+                if col >= self.recurring_table.columnCount():
+                    continue
                 item = QTableWidgetItem(str(value))
                 
                 # 类型列颜色
@@ -4570,6 +5639,19 @@ class FinanceApp(QMainWindow):
                     item.setText(f"{float(value):.2f}")
                 
                 self.recurring_table.setItem(row, col, item)
+        
+            # ★ v6.9：频率/结束日期之后，把「下次执行」一栏改写为真正的下次执行日
+            freq_text = trans[4]
+            anchor_text = trans[5]
+            next_stored = trans[7] if len(trans) > 7 else None
+            display_next = next_stored
+            if not display_next and freq_text:
+                anchor = QDate.fromString(anchor_text or "", "yyyy-MM-dd")
+                calc = self.calculate_next_date(anchor, freq_text) if anchor.isValid() else None
+                display_next = calc.toString("yyyy-MM-dd") if calc else ""
+            cell = self.recurring_table.item(row, 5)
+            if cell is not None:
+                cell.setText(display_next or "")
         
         self.recurring_table.resizeColumnsToContents()
 
@@ -4598,8 +5680,21 @@ class FinanceApp(QMainWindow):
         type_, amount, category, desc, account_id, tags, receipt, freq, end_date = trans
         
         # 计算下次执行日期
+        # ★ v6.9（P2-3）：优先用已存的「下次执行日」，它与界面显示保持一致；
+        #   没有（老库/首执行）才从今天往后推，保持 v6.8 原有口径。
         today = QDate.currentDate()
-        next_date = self.calculate_next_date(today, freq)
+        stored_next = None
+        try:
+            self.cursor.execute(
+                "SELECT recurring_next_date FROM transactions WHERE id=?", (trans_id,))
+            row_next = self.cursor.fetchone()
+            if row_next and row_next[0]:
+                q = QDate.fromString(row_next[0], "yyyy-MM-dd")
+                if q.isValid() and q > today:
+                    stored_next = q
+        except sqlite3.OperationalError:
+            stored_next = None
+        next_date = stored_next or self.calculate_next_date(today, freq)
         
         if not next_date:
             self.statusBar().showMessage("❌ 无法计算下次执行日期!", 5000)
@@ -4616,29 +5711,43 @@ class FinanceApp(QMainWindow):
         self.save_state_before_change()
         
         # 添加新交易记录
+        # ★ v7.2：定期交易按「模板里存的时间」生成（模板没有时间则用 00:00:00）
+        _rec_tpl_time = REC_TIME_DEFAULT
+        try:
+            self.cursor.execute(
+                "SELECT rec_time FROM transactions WHERE id=?", (trans_id,))
+            _row_t = self.cursor.fetchone()
+            if _row_t and _row_t[0]:
+                _rec_tpl_time = _row_t[0]
+        except sqlite3.OperationalError:
+            _rec_tpl_time = REC_TIME_DEFAULT
         self.cursor.execute('''
             INSERT INTO transactions 
             (type, amount, category, description, date, account_id, tags, 
-             receipt_image, is_recurring, recurring_freq, recurring_end)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+             receipt_image, is_recurring, recurring_freq, recurring_end, rec_time)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
         ''', (type_, amount, category, desc, next_date.toString("yyyy-MM-dd"), 
-              account_id, tags, receipt, freq, end_date))
+              account_id, tags, receipt, freq, end_date, _rec_tpl_time))
         
-        # 更新原定期交易的下次执行日期
-        self.cursor.execute('''
-            UPDATE transactions SET date=?
-            WHERE id=?
-        ''', (next_date.toString("yyyy-MM-dd"), trans_id))
+        # ★ v6.9（P2-3）：原定期记录是「模板 + 历史锚点」，以前把它的 date 直接改成
+        #   下次执行日，等于篡改历史（上月那笔在账本上凭空变成下月），越滚越乱。
+        #   现在不再改 date，只把下一次执行日记到 recurring_next_date 列（有则写，
+        #   无则回落到按月推进），模板日期保持不动。
+        next_str = next_date.toString("yyyy-MM-dd")
+        try:
+            self.cursor.execute(
+                'UPDATE transactions SET recurring_next_date=? WHERE id=?',
+                (next_str, trans_id))
+        except sqlite3.OperationalError:
+            # 老库还没有该列（迁移未跑）：退化为不动 date，下次执行按本次推算日期
+            print("[execute_recurring_transaction] 缺少 recurring_next_date 列，已跳过")
         
         self.conn.commit()
         
-        # 更新账户余额
-        self.update_account_balance(account_id)
-        
         self.statusBar().showMessage("✅ 定期交易已执行!", 5000)
         self.load_recurring_transactions()
-        self.load_data()
-        self.update_statistics()
+        # ★ v6.9：统一重算（含账户余额与余额快照），不再只 update_account_balance
+        self.refresh_after_change(next_str)
 
     def calculate_next_date(self, last_date, freq):
         """计算下次执行日期"""
@@ -4680,10 +5789,9 @@ class FinanceApp(QMainWindow):
             ''', (trans_id,))
             self.conn.commit()
             
-            self.statusBar().showMessage("✅ 定期交易已删除!", 5000)
+            # ★ v6.9（P2-2）：删掉定期交易后只刷了表格与统计，账户余额一次没重算（漏算）。
             self.load_recurring_transactions()
-            self.load_data()
-            self.update_statistics()
+            self.refresh_after_change(None, "✅ 定期交易已删除!")
 
     def currency_converter(self):
         """汇率转换器"""
@@ -4758,7 +5866,7 @@ class FinanceApp(QMainWindow):
         layout.addRow(convert_btn)
         
         dialog.setLayout(layout)
-        dialog.exec_()
+        dialog.exec()
 
 
     def convert_currency(self, amount_edit, from_currency_combo, to_currency_combo, 
@@ -4830,22 +5938,30 @@ class FinanceApp(QMainWindow):
                 writer = csv.writer(csvfile)
                 
                 # 写入标题行
+                # ★ v7.2：日期列导出为「2026-11-21 16:31:0600」（date + rec_time 拼装）
                 writer.writerow([
                     "ID", "类型", "金额", "分类", "描述", "日期", 
                     "状态", "关联ID", "账户", "标签", "收据图片"
                 ])
                 
                 # 获取所有数据
-                self.cursor.execute("""
+                # ★ v7.5：账户列取「有效账户归属」（还款跟随所属借款的账户），
+                #   以前 JOIN 裸 account_id，历史挂 -1 的还款导出后账户列是空的。
+                _eff_t = self._eff_account("t")
+                self.cursor.execute(f"""
                     SELECT t.id, t.type, t.amount, t.category, t.description, t.date, 
-                           t.status, t.related_id, a.name, t.tags, t.receipt_image
+                           t.status, t.related_id,
+                           (SELECT a2.name FROM accounts a2 WHERE a2.id = {_eff_t}) AS acc_name,
+                           t.tags, t.receipt_image,
+                           t.rec_time
                     FROM transactions t
-                    LEFT JOIN accounts a ON t.account_id = a.id
-                    ORDER BY t.date, t.id
+                    ORDER BY t.date, IFNULL(t.rec_time,'00:00:00'), t.id
                 """)
                 
                 for row in self.cursor.fetchall():
-                    writer.writerow(row)
+                    row = list(row)
+                    row[5] = format_rec_datetime(row[5], row[11] if len(row) > 11 else None)
+                    writer.writerow(row[:11])
                 
             self.statusBar().showMessage(f"✅ 数据已导出到 {file_name}", 5000)
         except Exception as e:
@@ -4882,17 +5998,22 @@ class FinanceApp(QMainWindow):
             ]
             ws.append(headers)
             
-            # 获取所有数据
-            self.cursor.execute("""
+            # 获取所有数据（★ v7.2：日期列拼接成 2026-11-21 16:31:0600）
+            # ★ v7.5：账户列同样取「有效账户归属」，与界面/CSV 口径一致。
+            _eff_t = self._eff_account("t")
+            self.cursor.execute(f"""
                 SELECT t.id, t.type, t.amount, t.category, t.description, t.date, 
-                       t.status, t.related_id, a.name, t.tags
+                       t.status, t.related_id,
+                       (SELECT a2.name FROM accounts a2 WHERE a2.id = {_eff_t}) AS acc_name,
+                       t.tags, t.rec_time
                 FROM transactions t
-                LEFT JOIN accounts a ON t.account_id = a.id
-                ORDER BY t.date, t.id
+                ORDER BY t.date, IFNULL(t.rec_time,'00:00:00'), t.id
             """)
             
             for row in self.cursor.fetchall():
-                ws.append(row)
+                row = list(row)
+                row[5] = format_rec_datetime(row[5], row[10] if len(row) > 10 else None)
+                ws.append(row[:10])
             
             # 设置列宽
             for col in range(1, len(headers) + 1):
@@ -5039,6 +6160,56 @@ class FinanceApp(QMainWindow):
             if result:
                 self.scroll_bottom_after_add = (str(result[0]) == "1")
 
+            # ★ v5.1 「添加记录」弹窗组件显示开关（同上，必须在 save_settings 之前读）
+            self.cursor.execute("SELECT value FROM settings WHERE key='show_loan_combo'")
+            result = self.cursor.fetchone()
+            if result:
+                self.show_loan_combo = (str(result[0]) == "1")
+            self.cursor.execute("SELECT value FROM settings WHERE key='show_receipt_btn'")
+            result = self.cursor.fetchone()
+            if result:
+                self.show_receipt_btn = (str(result[0]) == "1")
+            # ★ v6.3 「定期交易」勾选框开关（同上，必须在 save_settings 之前读）
+            self.cursor.execute("SELECT value FROM settings WHERE key='show_recurring_check'")
+            result = self.cursor.fetchone()
+            if result:
+                self.show_recurring_check = (str(result[0]) == "1")
+
+            # ★ v7.6 列表显示：每页行数 / 是否显示时间（同样必须在 save_settings 之前读，
+            #   否则下面 update_date_range -> save_settings 会用默认值把它们盖掉）
+            self.cursor.execute("SELECT value FROM settings WHERE key='page_size'")
+            result = self.cursor.fetchone()
+            if result:
+                try:
+                    _n = int(result[0])
+                    if _n > 0:
+                        self.page_size = _n
+                except (ValueError, TypeError):
+                    pass
+            self.cursor.execute("SELECT value FROM settings WHERE key='show_time_in_list'")
+            result = self.cursor.fetchone()
+            if result:
+                self.show_time_in_list = (str(result[0]) == "1")
+
+            # ★ v7.6 「上次看到哪一行」：锚点 = 那一行的全局行号（不是页码）。
+            #   锚点不随每页行数变化，改完每页行数也能落回同一行附近。
+            self.cursor.execute("SELECT value FROM settings WHERE key='list_anchor'")
+            result = self.cursor.fetchone()
+            if result:
+                try:
+                    self._page_anchor = max(0, int(result[0]))
+                except (ValueError, TypeError):
+                    self._page_anchor = 0
+            self.cursor.execute("SELECT value FROM settings WHERE key='list_scroll'")
+            result = self.cursor.fetchone()
+            try:
+                self._restore_scroll_value = max(0, int(result[0])) if result else 0
+            except (ValueError, TypeError):
+                self._restore_scroll_value = 0
+            _size_now = self._effective_page_size()
+            self._page_index = self._page_anchor // _size_now if _size_now else 0
+            self._restore_scroll_pending = True
+
             # 加载日期范围配置
             self.cursor.execute("SELECT value FROM settings WHERE key='date_range'")
             result = self.cursor.fetchone()
@@ -5059,14 +6230,12 @@ class FinanceApp(QMainWindow):
                     self.type_combo.setCurrentText(result[0])
                     self.last_selections['type'] = result[0]
                     
-            # 加载最后选择的账户
-            self.cursor.execute("SELECT value FROM settings WHERE key='last_account'")
-            result = self.cursor.fetchone()
-            if result and hasattr(self, 'account_combo') and self.account_combo is not None:
-                index = self.account_combo.findText(result[0])
-                if index >= 0:
-                    self.account_combo.setCurrentIndex(index)
-                    self.last_selections['account'] = (result[0], self.account_combo.currentData())
+            # 加载最后选择的账户（★ v7.1 优先按 id 恢复，账户改名也不会丢）
+            if hasattr(self, 'account_combo') and self.account_combo is not None:
+                self.restore_account_selection(self.account_combo)
+                if self._valid_account_id(self.account_combo.currentData()):
+                    self.last_selections['account'] = (self.account_combo.currentText(),
+                                                      self.account_combo.currentData())
                         
             # 加载最后选择的类别
             self.cursor.execute("SELECT value FROM settings WHERE key='last_category'")
@@ -5101,6 +6270,14 @@ class FinanceApp(QMainWindow):
                 self.showMaximized()
         except Exception as e:
             print(f"加载设置失败: {str(e)}")
+            # ★ v7.1 出错也要放开写入，否则用户之后的选择永远不落盘
+            self._settings_restoring = False
+        else:
+            # ★ v7.1 正常结束才放开写入。**这里必须用 else 而不是 finally**：
+            #   函数开头的「type_combo 还没建好」早退是 create_search_bar() 里那次
+            #   试探性调用，若那时就把标志清掉，紧接着 create_input_form() 的
+            #   update_form() 又会把账户默认值写回库，等于白改。
+            self._settings_restoring = False
 
 
 
@@ -5122,6 +6299,16 @@ class FinanceApp(QMainWindow):
             # 程序选项（★ v4.9）：添加记录后是否自动滚到列表底部
             # 对话框里点选也会立即写同名键，这里是“退出时兵底保存”
             settings['scroll_bottom_after_add'] = "1" if self.scroll_bottom_after_add else "0"
+
+            # 「添加记录」弹窗组件显示开关（★ v5.1 / ★ v6.3）
+            settings['show_loan_combo'] = "1" if self.show_loan_combo else "0"
+            settings['show_receipt_btn'] = "1" if self.show_receipt_btn else "0"
+            settings['show_recurring_check'] = "1" if self.show_recurring_check else "0"
+
+            # ★ v7.6 列表显示（纯显示层，跟计算无关）
+            settings['page_size'] = str(self._effective_page_size())
+            settings['show_time_in_list'] = "1" if self.show_time_in_list else "0"
+            settings['list_anchor'] = str(int(self._page_start_index))
 
             # 窗口几何与最大化状态
             # ★ v4.5 启动恢复期间（_geom_restoring=True）不写：否则 __init__ 里默认的
@@ -5170,10 +6357,15 @@ class FinanceApp(QMainWindow):
         """
         dialog = SettingsDialog(
             self,
-            values={"scroll_bottom_after_add": self.scroll_bottom_after_add},
+            values={"scroll_bottom_after_add": self.scroll_bottom_after_add,
+                    "show_loan_combo": self.show_loan_combo,
+                    "show_receipt_btn": self.show_receipt_btn,
+                    "show_recurring_check": self.show_recurring_check,
+                    "page_size": self._effective_page_size(),
+                    "show_time_in_list": self.show_time_in_list},
             on_change=self._on_setting_changed,
         )
-        dialog.exec_()
+        dialog.exec()
         return dialog
 
     def _on_setting_changed(self, key, value):
@@ -5182,6 +6374,40 @@ class FinanceApp(QMainWindow):
             self.scroll_bottom_after_add = bool(value)
             self.statusBar().showMessage(
                 "设置已保存：添加记录后" + ("自动滚动到列表底部" if value else "保持列表位置"), 4000)
+        elif key == "show_loan_combo":
+            self.show_loan_combo = bool(value)
+            self.statusBar().showMessage(
+                "设置已保存：「添加记录」窗口" + ("显示" if value else "隐藏") + "「关联借款」", 4000)
+        elif key == "show_receipt_btn":
+            self.show_receipt_btn = bool(value)
+            self.statusBar().showMessage(
+                "设置已保存：「添加记录」窗口" + ("显示" if value else "隐藏") + "「添加收据」", 4000)
+        elif key == "show_recurring_check":
+            self.show_recurring_check = bool(value)
+            self.statusBar().showMessage(
+                "设置已保存：「添加记录」窗口" + ("显示" if value else "隐藏") + "「定期交易」", 4000)
+        elif key == "page_size":
+            try:
+                size = int(value)
+            except (ValueError, TypeError):
+                size = 100
+            if size <= 0:
+                size = 100
+            # 保持「当前看到的那一行」：锚点行号不变，只把页号按新行数折算
+            self.page_size = size
+            self._page_index = self._page_start_index // size if size else 0
+            self._render_page(self._all_records or [])
+            self.statusBar().showMessage(f"设置已保存：每页 {size} 行（只影响显示，不影响任何计算）", 4000)
+            self.set_app_setting("page_size", size)
+            return
+        elif key == "show_time_in_list":
+            self.show_time_in_list = bool(value)
+            # 立刻按当前页重绘一次，开关效果马上能看到
+            self._render_page(self._all_records or [])
+            self.statusBar().showMessage(
+                "设置已保存：列表日期" + ("显示时分秒" if value else "只显示日期（截图模式）"), 4000)
+            self.set_app_setting("show_time_in_list", "1" if value else "0")
+            return
         self.set_app_setting(key, "1" if value else "0")
 
     def _scroll_table_to_bottom(self):
@@ -5196,6 +6422,15 @@ class FinanceApp(QMainWindow):
         if table is None:
             return
         try:
+            # ★ v7.6 分页：新记录在最后一页，先翻到末页再滚到底，
+            #   否则停在第 1 页怎么滚都看不到刚添加的那条。
+            records = self._all_records or []
+            size = self._effective_page_size()
+            if records and size > 0:
+                last_page = max(0, (len(records) + size - 1) // size - 1)
+                if last_page != self._page_index:
+                    self._page_index = last_page
+                    self._render_page(records)
             table.scrollToBottom()
         except Exception:
             pass
@@ -5264,7 +6499,7 @@ class FinanceApp(QMainWindow):
         layout.addWidget(button_box)
         
         dialog.setLayout(layout)
-        dialog.exec_()
+        dialog.exec()
 
 
 
@@ -5337,6 +6572,13 @@ class FinanceApp(QMainWindow):
         # 先停几何定时器，再强制保存一次配置（含窗口几何）
         if self.__dict__.get('_geom_save_timer') is not None:
             self._geom_save_timer.stop()
+        # ★ v7.6 关窗时把「看到哪一行」补写一次（防抖定时器可能还没到点）
+        try:
+            if self.__dict__.get('_page_save_timer') is not None:
+                self._page_save_timer.stop()
+            self._save_list_position()
+        except Exception as e:
+            print(f"退出时保存列表位置失败: {e}")
         self.save_settings()
 
         # 停止定时器
@@ -5348,6 +6590,12 @@ class FinanceApp(QMainWindow):
         self.close_current_db()
         if hasattr(self, 'master_conn'):
             self.master_conn.close()
+
+        # ★ v6.8 退出前对主库 / launcher 各做一次变化即备份（抓退出前最后的改动）
+        try:
+            self.auto_backup_external()
+        except Exception as e:
+            print(f"退出时变化备份失败: {str(e)}")
         
         # 清理临时撤销文件
         for file in self.operation_stack:
@@ -5379,11 +6627,29 @@ class FinanceApp(QMainWindow):
         self.date_from_edit = None
         self.date_to_edit = None
         
+        # ★ v7.1 重建界面期间禁止 save_last_* 回写：create_input_form() 里的
+        #   update_form() 会把账户下拉框切到第一个账户，若不拦住就会把
+        #   刚刚切换到的这个用户的「上次账户」用默认值覆盖。
+        self._settings_restoring = True
+
+        # ★ v7.6 切用户时清掉上一个用户的分页状态（否则会把别人的「看到第几行」带过来；
+        #   load_settings 随后会读这个用户自己的 list_anchor 覆盖掉）
+        self._all_records = None
+        self._page_index = 0
+        self._page_start_index = 0
+        self._page_anchor = 0
+        self._restore_scroll_pending = False
+        self._restore_scroll_value = 0
+
         # 重新创建UI组件
         self.create_search_bar()
         self.create_tabs()
         self.create_input_form()
         self.create_action_buttons()
+
+        # ★ v7.1 切换用户后要重新加载这个用户自己的设置（原来漏了，
+        #   导致切用户后类型/账户/类别沿用上一个用户的值，也不恢复窗口设置）
+        self.load_settings()
         
         # 加载数据
         self.load_data()
@@ -5457,12 +6723,16 @@ class FinanceApp(QMainWindow):
             return
         
         # 直接从accounts表获取余额
-        self.cursor.execute("""
+        # ★ v7.5：收入/支出两列的汇总也走「有效账户归属」——
+        #   以前用裸 account_id，历史挂错账户的还款不计入本账户收入列，
+        #   面板上 income 少一截、账户结余跟着错（用户截图 37608.96 vs 38625.42）。
+        _eff_t = self._eff_account("t")
+        self.cursor.execute(f"""
             SELECT a.id, a.name, a.balance,
-                (SELECT SUM(amount) FROM transactions 
-                WHERE account_id=a.id AND (type='income' OR type='还款')) as income,
-                (SELECT SUM(amount) FROM transactions 
-                WHERE account_id=a.id AND (type='expense' OR type='借款')) as expense
+                (SELECT SUM(t.amount) FROM transactions t
+                WHERE {_eff_t}=a.id AND (t.type='income' OR t.type='还款')) as income,
+                (SELECT SUM(t.amount) FROM transactions t
+                WHERE {_eff_t}=a.id AND (t.type='expense' OR t.type='借款')) as expense
             FROM accounts a
             ORDER BY a.name
         """)
@@ -5491,39 +6761,32 @@ class FinanceApp(QMainWindow):
 
 
     def calculate_and_update_balances(self):
-        """计算并更新所有账户余额"""
+        """计算并更新所有账户余额（★ v6.9：改走统一余额层）
+
+        以前这里自己拼一份「流水净额」SQL 直接覆盖 accounts.balance，等于把
+        用户填的初始余额抹掉（少计）。现在统一由 _recalc_all_account_balances
+        负责，公式只有一处定义，不再各拼一份。
+        """
         # 保存当前状态以便撤销
         self.save_state_before_change()
-        
-        # 获取所有账户
-        self.cursor.execute("SELECT id, name FROM accounts")
-        accounts = self.cursor.fetchall()
-        
-        for account_id, account_name in accounts:
-            # 计算账户余额
-            self.cursor.execute("""
-                SELECT 
-                    SUM(CASE WHEN type='income' THEN amount ELSE 0 END) -
-                    SUM(CASE WHEN type='expense' THEN amount ELSE 0 END) +
-                    SUM(CASE WHEN type='还款' THEN amount ELSE 0 END) -
-                    SUM(CASE WHEN type='借款' THEN amount ELSE 0 END)
-                FROM transactions
-                WHERE account_id=? AND type != 'balance'
-            """, (account_id,))
-            
-            balance = self.cursor.fetchone()[0] or 0
-            
-            # 更新账户余额
-            self.cursor.execute("""
-                UPDATE accounts SET balance=? WHERE id=?
-            """, (balance, account_id))
-        
-        self.conn.commit()
+
+        self._recalc_all_account_balances()
         self.update_account_balances()  # 更新UI显示
         self.statusBar().showMessage("✅ 账户余额已重新计算并更新", 5000)
 
     def update_future_balances(self, from_date):
-        """更新从指定日期开始的所有余额记录"""
+        """更新从指定日期开始的所有余额记录
+
+        ★ v6.9：快照口径与账户余额口径对齐 ——
+          总余额快照 = 所有账户初始余额之和 + 截至当日流水净额；
+          账户快照   = 该账户初始余额       + 截至当日流水净额。
+        以前两处都只算「流水净额」，没算初始余额，于是「余额统计」里的数字
+        永远比账户余额少一截（少计），用户拿两个数字对不上。
+        """
+        # 0. 初始余额合计（用常量，避免每轮每日期都去查一次）
+        self.cursor.execute("SELECT IFNULL(SUM(IFNULL(initial_balance,0)),0) FROM accounts")
+        total_initial = self.cursor.fetchone()[0] or 0
+
         # 1. 更新所有账户的总余额记录
         self.cursor.execute("""
             SELECT DISTINCT date FROM transactions
@@ -5534,18 +6797,15 @@ class FinanceApp(QMainWindow):
         balance_dates = [row[0] for row in self.cursor.fetchall()]
         
         for balance_date in balance_dates:
-            # 计算新的总余额
-            self.cursor.execute("""
-                SELECT 
-                    SUM(CASE WHEN type='income' THEN amount ELSE 0 END) -
-                    SUM(CASE WHEN type='expense' THEN amount ELSE 0 END) +
-                    SUM(CASE WHEN type='还款' THEN amount ELSE 0 END) -
-                    SUM(CASE WHEN type='借款' THEN amount ELSE 0 END)
-                FROM transactions
+            # 计算新的总余额（初始余额合计 + 截至当日流水净额）
+            # ★ v7.4：口径只保留一份（self._NET_FLOW_SQL）—— 以前这里手抄了一遍，
+            #   常量一改而这里忘改就会两套口径并行（多算/少算的经典来源）。
+            self.cursor.execute(f"""
+                SELECT {self._NET_FLOW_SQL}
                 WHERE date <= ? AND type != 'balance'
             """, (balance_date,))
             
-            new_balance = self.cursor.fetchone()[0] or 0
+            new_balance = (self.cursor.fetchone()[0] or 0) + total_initial
             
             # 更新总余额记录
             self.cursor.execute("""
@@ -5555,10 +6815,11 @@ class FinanceApp(QMainWindow):
             """, (new_balance, balance_date))
         
         # 2. 更新各账户的余额记录
-        self.cursor.execute("SELECT id FROM accounts")
-        account_ids = [row[0] for row in self.cursor.fetchall()]
+        self.cursor.execute("SELECT id, IFNULL(initial_balance,0) FROM accounts")
+        account_rows = self.cursor.fetchall()
         
-        for account_id in account_ids:
+        _eff = self._eff_account()
+        for account_id, acc_initial in account_rows:
             self.cursor.execute("""
                 SELECT DISTINCT date FROM transactions
                 WHERE type='balance' AND account_id=? AND date >= ?
@@ -5568,18 +6829,16 @@ class FinanceApp(QMainWindow):
             balance_dates = [row[0] for row in self.cursor.fetchall()]
             
             for balance_date in balance_dates:
-                # 计算新的账户余额
-                self.cursor.execute("""
-                    SELECT 
-                        SUM(CASE WHEN type='income' THEN amount ELSE 0 END) -
-                        SUM(CASE WHEN type='expense' THEN amount ELSE 0 END) +
-                        SUM(CASE WHEN type='还款' THEN amount ELSE 0 END) -
-                        SUM(CASE WHEN type='借款' THEN amount ELSE 0 END)
-                    FROM transactions
-                    WHERE date <= ? AND type != 'balance' AND account_id=?
+                # 计算新的账户余额（口径同上，统一取 self._NET_FLOW_SQL）
+                # ★ v7.5：这条是「账户快照」最容易算错的地方 —— 必须用有效归属，
+                #   否则挂错账户的历史还款永远进不了本账户的快照（741 就是这么错的）。
+                self.cursor.execute(f"""
+                    SELECT {self._NET_FLOW_SQL}
+                    WHERE date <= ? AND type != 'balance' AND {_eff} = ?
                 """, (balance_date, account_id))
                 
-                new_balance = self.cursor.fetchone()[0] or 0
+                # ★ v6.9：账户快照同样要加上该账户的初始余额
+                new_balance = (self.cursor.fetchone()[0] or 0) + (acc_initial or 0)
                 
                 # 更新账户余额记录
                 self.cursor.execute("""
@@ -5593,9 +6852,16 @@ class FinanceApp(QMainWindow):
 
     def show_add_record_dialog(self):
         """显示添加记录弹窗"""
+        # ★ v7.0：「添加记录」弹窗允许被记忆/恢复为默认的类型，只含四个日常类型。
+        #   余额 / 账户结余 / 待还款合计 是一次性快照（金额框禁用、点 OK 直接写快照），
+        #   不该被记忆成下次打开时的默认值——否则极易在错误类型下点「一键还款」。
+        RESTORABLE_TYPES = ("收入", "支出", "借款", "还款")
         dialog = QDialog(self)
         dialog.setWindowTitle("添加新记录")
-        dialog.resize(680, 640)
+        # 宽度固定够用；**高度在布局建完后按 sizeHint 自适应**（★ v6.4，见函数末尾）——
+        # 原来写死 resize(680, 640)，而内容其实只要 ~420px，
+        # 多出来的 ~220px 会被 QFormLayout 摊到各行上，把「交易提醒信息」区块从 127px 撑到 346px。
+        dialog.setMinimumWidth(680)
         
         layout = QVBoxLayout()
         
@@ -5607,8 +6873,22 @@ class FinanceApp(QMainWindow):
         type_combo.addItems(["收入", "支出", "借款", "还款", "余额", "账户结余", "待还款合计"])
         
         # 恢复上次选择的类型
-        if self.last_selections.get('type'):
-            index = type_combo.findText(self.last_selections['type'])
+        # ★ v7.0：只恢复「收入 / 支出 / 借款 / 还款」这四个日常类型。
+        #   「余额 / 账户结余 / 待还款合计」是一次性快照类型（金额框被禁用、点 OK 就
+        #   写一条快照），把它们恢复成默认，等于让弹窗一打开就停在最容易误存的类型上——
+        #   正是「点了一键还款却存成账户结余」的放大器。
+        _restore_type = self.last_selections.get('type')
+        if _restore_type not in RESTORABLE_TYPES:
+            # ★ v7.1 内存里没有就独立读库兜底（切换用户后 last_selections 可能还没同步）
+            try:
+                self.cursor.execute("SELECT value FROM settings WHERE key='last_type'")
+                _row = self.cursor.fetchone()
+                if _row and _row[0] in RESTORABLE_TYPES:
+                    _restore_type = _row[0]
+            except sqlite3.Error:
+                _restore_type = None
+        if _restore_type in RESTORABLE_TYPES:
+            index = type_combo.findText(_restore_type)
             if index >= 0:
                 type_combo.setCurrentIndex(index)
         
@@ -5628,20 +6908,24 @@ class FinanceApp(QMainWindow):
         account_combo.addItem("全部结余", -1)
         self.load_account_combo_to(account_combo)
 
-        # 恢复上次选择的账户
-        if self.last_selections.get('account'):
-            account_text, account_data = self.last_selections['account']
-            index = account_combo.findText(account_text)
-            if index >= 0:
-                account_combo.setCurrentIndex(index)
+        # 恢复上次选择的账户（★ v7.1 走主窗口同一套恢复逻辑：先按 id、再按名称、
+        #   最后兜底第一个真实账户；账户改名后也不会退回默认）
+        self.restore_account_selection(account_combo)
 
         form_layout.addRow("账户:", account_combo)
         
-        # 日期
+        # 日期 + 时间（★ v7.2：时间独立控件，date 列仍是纯 YYYY-MM-DD）
         date_edit = QDateEdit()
         date_edit.setDate(QDate.currentDate())
         date_edit.setCalendarPopup(True)
-        form_layout.addRow("日期:", date_edit)
+        date_edit.setDisplayFormat("yyyy-MM-dd")
+        time_edit = QTimeEdit()
+        time_edit.setDisplayFormat("HH:mm:ss")
+        time_edit.setTime(QTime.currentTime())
+        _date_row = QHBoxLayout()
+        _date_row.addWidget(date_edit)
+        _date_row.addWidget(time_edit)
+        form_layout.addRow("日期:", _date_row)
         
         # 描述
         desc_edit = QLineEdit()
@@ -5656,39 +6940,70 @@ class FinanceApp(QMainWindow):
         # ========================================================
         # 交易提醒信息（★ v4.1 新增）
         # 粘贴银行公众号 / 微信 / 支付宝 的交易提醒，自动解析并填写
-        # 金额 / 描述(交易商户) / 日期（以及类型 收入|支出）
+        # 金额 / 描述(交易商户；无商户时用交易附言；再无则用交易类型) / 日期
+        # （以及类型 收入|支出）
         # ========================================================
         notice_box = QGroupBox("交易提醒信息（粘贴后自动填写 金额 / 描述 / 日期）")
         notice_layout = QVBoxLayout()
+        # ★ v6.3 压缩整块高度：内边距/间距收紧，输入框 96px → 68px（约 3 行）
+        notice_layout.setContentsMargins(6, 4, 6, 4)
+        notice_layout.setSpacing(4)
 
         notice_edit = QTextEdit()
         notice_edit.setPlaceholderText(
-            "把微信里收到的银行公众号交易提醒（或支付宝交易提醒）粘贴到这里，例如：\n"
-            "您尾号1234的储蓄卡9月18日14:30消费人民币12.34元，账户余额1,234.56元。\n"
-            "银行 App 那种分行式的「交易提醒」（交易金额/交易附言…）也支持；\n"
-            "没有商户信息时，会把【交易附言】填到描述。"
+            "粘贴微信/支付宝/银行 App 的交易提醒 → 自动填写 金额 / 描述 / 日期。\n"
+            "无商户时用「交易附言」；连附言也没有时用「交易类型」后面的内容。"
         )
-        notice_edit.setFixedHeight(96)
+        # ★ v6.3 最小高度 68（约 3 行）；★ v6.5 改成**可伸缩**：
+        #   不再 setFixedHeight —— 窗口上下拉伸时，多出来的高度全部给这个粘贴框（用户要求）。
+        #   默认打开时弹窗高 = 紧凑尺寸（见函数末尾），粘贴框就是 68px 左右。
+        notice_edit.setMinimumHeight(68)
+        notice_edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         notice_layout.addWidget(notice_edit)
 
         notice_btn_row = QHBoxLayout()
+        notice_btn_row.setSpacing(6)
         notice_parse_btn = QPushButton("🔍 解析并填写")
         notice_clear_btn = QPushButton("清空")
+        for _btn in (notice_parse_btn, notice_clear_btn):
+            _btn.setFixedHeight(26)
+        # ★ v6.3：状态文字改成**单行**——原来 wordWrap=True 时会折成两行，
+        #   把整个按钮行顶高（用户反馈“占高度太多”）；
+        #   超出宽度的部分被裁掉，完整内容放 tooltip，鼠标悬停即可看全。
         notice_status = QLabel("")
-        notice_status.setWordWrap(True)
+        notice_status.setWordWrap(False)
+        notice_status.setFixedHeight(26)
+        notice_status.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         notice_status.setStyleSheet("color: #2e7d32;")
+        notice_status.setTextInteractionFlags(Qt.TextSelectableByMouse)
         notice_btn_row.addWidget(notice_parse_btn)
         notice_btn_row.addWidget(notice_clear_btn)
         notice_btn_row.addWidget(notice_status, 1)
         notice_layout.addLayout(notice_btn_row)
 
         notice_box.setLayout(notice_layout)
+        # ★ v6.4/v6.5：竖直方向可扩展 —— 但**内部只有粘贴框会吸收**（按钮行是固定高），
+        # 所以拉高窗口 = 粘贴框变大，不会出现一大片空白。
+        notice_box.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         form_layout.addRow(notice_box)
 
-        # 关联借款选择（仅还款时显示）
+        # 关联借款选择（仅还款时显示；能不能显示还受设置 show_loan_combo 控制 ★ v5.1）
         loan_combo = QComboBox()
-        loan_combo.setVisible(False)
         form_layout.addRow("关联借款:", loan_combo)
+
+        def set_loan_row_visible(visible):
+            """显示/隐藏「关联借款」整行（标签 + 下拉框）
+
+            两重条件：① 当前类型是「还款」；② 设置 show_loan_combo 开着（★ v5.1）。
+            手动把标签也 setVisible 一下：不依赖 QFormLayout 对隐藏字段的隐式行隐藏。
+            """
+            visible = bool(visible) and bool(self.show_loan_combo)
+            loan_combo.setVisible(visible)
+            label = form_layout.labelForField(loan_combo)
+            if label is not None:
+                label.setVisible(visible)
+
+        set_loan_row_visible(False)
 
         # 待还款合计标签
         remaining_label = QLabel("待还款合计: 0.00 元")
@@ -5727,6 +7042,8 @@ class FinanceApp(QMainWindow):
                     receipt_image_data = None
         
         receipt_btn.clicked.connect(add_receipt)
+        # 是否显示「添加收据」按钮受设置 show_receipt_btn 控制（★ v5.1）
+        receipt_btn.setVisible(bool(self.show_receipt_btn))
         form_layout.addRow(receipt_btn)
         
         # 定期交易相关控件
@@ -5740,20 +7057,17 @@ class FinanceApp(QMainWindow):
         recurring_end_edit.setVisible(False)
         
         def toggle_recurring(state):
-            visible = state == Qt.Checked
+            # ★ v6.0：stateChanged 发的是 int，Qt.CheckState 是普通 Enum，必须走 qt_eq
+            visible = qt_eq(state, Qt.Checked)
             recurring_freq_combo.setVisible(visible)
             recurring_end_edit.setVisible(visible)
-            
-            # 调整标签位置
-            for i in range(form_layout.count()):
-                item = form_layout.itemAt(i)
-                if item.widget() == recurring_freq_combo.parent():
-                    layout = item.layout()
-                    if layout:
-                        for j in range(layout.count()):
-                            widget = layout.itemAt(j).widget()
-                            if widget and widget.text() in ["频率:", "结束于:"]:
-                                widget.setVisible(visible)
+            # ★ v6.3 修正既有 Bug：原来这里靠「遍历 form_layout、比较
+            #   item.widget() == recurring_freq_combo.parent()」去找标签，条件永远不成立
+            #   （下拉框的 parent 是对话框，不是布局里的控件）＝死代码，
+            #   结果勾上「定期交易」后「频率 / 结束于」两个标签不显示。
+            #   直接持有标签引用即可。
+            freq_label.setVisible(visible)
+            end_label.setVisible(visible)
         
         recurring_check.stateChanged.connect(toggle_recurring)
         
@@ -5767,6 +7081,18 @@ class FinanceApp(QMainWindow):
         form_layout.addRow(end_label, recurring_end_edit)
         
         form_layout.addRow(recurring_check)
+
+        # 是否显示「定期交易」这一行受设置 show_recurring_check 控制（★ v6.3）
+        # 关掉时必须顺手取消勾选、并收起「频率 / 结束于」两行：
+        # 否则控件虽看不见，提交时仍可能被当成“定期交易”
+        # （process_add_record_dialog 读的正是 recurring_check.isChecked()）。
+        if not self.show_recurring_check:
+            recurring_check.setChecked(False)
+            recurring_check.setVisible(False)
+            freq_label.setVisible(False)
+            end_label.setVisible(False)
+            recurring_freq_combo.setVisible(False)
+            recurring_end_edit.setVisible(False)
 
         # 更新类别下拉框
         def update_category_combo(type_text):
@@ -5809,6 +7135,11 @@ class FinanceApp(QMainWindow):
         # 更新关联借款选择框
         def update_loan_combo():
             loan_combo.clear()
+            if not self.show_loan_combo:
+                # 该组件在设置里被关掉（★ v5.1）：不填任何选项
+                # → currentData() 为 None，即“不关联借款”；
+                # 否则用户看不见它，却会被隐式关联到列表里的第一笔借款。
+                return
             self.cursor.execute("""
                 SELECT id, amount, description, date 
                 FROM transactions 
@@ -5852,7 +7183,7 @@ class FinanceApp(QMainWindow):
             
             # 显示/隐藏关联借款选择
             if type_text == "还款":
-                loan_combo.setVisible(True)
+                set_loan_row_visible(True)
                 remaining_label.setVisible(True)
                 update_loan_combo()
                 update_remaining_total()
@@ -5860,7 +7191,7 @@ class FinanceApp(QMainWindow):
                 remaining_label.setVisible(True)
                 update_remaining_total()
             else:
-                loan_combo.setVisible(False)
+                set_loan_row_visible(False)
                 remaining_label.setVisible(False)
             
             # 处理账户下拉框状态
@@ -5891,21 +7222,25 @@ class FinanceApp(QMainWindow):
             else:
                 amount_edit.setEnabled(True)
 
-        # 连接信号以保存最后选择
-        type_combo.currentTextChanged.connect(self.save_last_type)
-        account_combo.currentIndexChanged.connect(self.save_last_account)
-        category_combo.currentTextChanged.connect(self.save_last_category)
-
         # 类型改变时更新界面
         type_combo.currentTextChanged.connect(update_form)
         
-        # 初始化界面
+        # 初始化界面（★ v7.1 必须放在下面连接「保存信号」之前：
+        #   update_form() 会把账户从「全部结余」切到别的项，早连就会把这个
+        #   中间态当成用户选择写进库）
         update_form(type_combo.currentText())
+
+        # ★ v7.1 连接信号以保存最后选择（显式传 combo，不再依赖 self.sender()）
+        type_combo.currentTextChanged.connect(self.save_last_type)
+        account_combo.currentIndexChanged.connect(
+            lambda _idx, _c=account_combo: self.save_last_account(_idx, _c))
+        category_combo.currentTextChanged.connect(self.save_last_category)
 
         # ---------------- 交易提醒解析并自动填写（★ v4.1） ----------------
         def apply_notice(silent=False):
-            """解析「交易提醒信息」并自动填写 类型 / 金额 / 描述(商户) / 日期
+            """解析「交易提醒信息」并自动填写 类型 / 金额 / 描述 / 日期
 
+            描述取值链（★ v4.2 / v5.0）：交易商户 → 交易附言/摘要/备注 → 「交易类型」后面的文字。
             silent=True 时为由粘贴触发的自动解析（无内容不提示）。
             """
             raw = notice_edit.toPlainText().strip()
@@ -5916,7 +7251,8 @@ class FinanceApp(QMainWindow):
 
             info = parse_transaction_notice(raw)
             filled, skipped = apply_transaction_notice(
-                info, type_combo, amount_edit, desc_edit, date_edit, enable_amount=False
+                info, type_combo, amount_edit, desc_edit, date_edit, enable_amount=False,
+                time_edit=time_edit
             )
 
             if filled:
@@ -5927,9 +7263,17 @@ class FinanceApp(QMainWindow):
                 notice_status.setText("")
             if skipped:
                 notice_status.setText(notice_status.text() + "；跳过：" + "、".join(skipped))
+            # ★ v6.3 状态单行显示，被裁掉的完整内容放 tooltip
+            notice_status.setToolTip(notice_status.text())
+
+        def clear_notice():
+            """清空粘贴框与状态（★ v6.3：tooltip 一起清，否则残留上一次的全文）"""
+            notice_edit.clear()
+            notice_status.clear()
+            notice_status.setToolTip("")
 
         notice_parse_btn.clicked.connect(lambda: apply_notice(silent=False))
-        notice_clear_btn.clicked.connect(lambda: (notice_edit.clear(), notice_status.clear()))
+        notice_clear_btn.clicked.connect(clear_notice)
 
         # 粘贴后自动解析（350ms 防抖，避免打字期间反复解析）
         notice_timer = QTimer(dialog)
@@ -5939,24 +7283,118 @@ class FinanceApp(QMainWindow):
         notice_edit.textChanged.connect(lambda: notice_timer.start())
 
         layout.addLayout(form_layout)
+
+        # ★ v6.5：**不要**在这里加 addStretch —— 否则窗口拉高时多出来的高度会被它吃掉，
+        # 粘贴框反而长不大。不给 stretch，富余空间就会落到表单里唯一可扩展的那一项
+        # （「交易提醒信息」→ 粘贴框）上。
         
         # 按钮
         button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         button_box.accepted.connect(lambda: self.process_add_record_dialog(
-            dialog, type_combo, amount_edit, category_combo, account_combo, 
-            date_edit, desc_edit, tags_edit, receipt_image_data, 
-            recurring_check, recurring_freq_combo, recurring_end_edit, loan_combo
+            dialog, type_combo, amount_edit, category_combo, account_combo,
+            date_edit, desc_edit, tags_edit, receipt_image_data,
+            recurring_check, recurring_freq_combo, recurring_end_edit, loan_combo,
+            time_edit
         ))
         button_box.rejected.connect(dialog.reject)
+
+        # ★ v6.6 一键还款：类型选「还款」时出现在 OK 左边，点了自动回填剩余金额并自动点 OK
+        # ★ v7.0 修复「点『添加记录』→ 再点『一键还款』，结果存成了『账户结余』/『收入』」：
+        #   根因是 QDialogButtonBox.addButton() 内部会对按钮调 show()，把上一行的
+        #   setVisible(当前类型=="还款") 直接顶掉 —— 弹窗一打开，这个按钮在任何类型下
+        #   都可见。用户点它时类型还是上次留下的（收入/支出/账户结余…），
+        #   process_add_record_dialog 就读到那个类型并原样提交，于是落库成 income 或
+        #   balance 快照。修法三条：
+        #     1) 可见性必须在 addButton 之后重新设一次（顺序敏感，不能只信 addButton 之前那次）；
+        #     2) on_one_click_repay 自己强制把类型切到「还款」并硬校验，绝不依赖外部状态；
+        #     3) 可见性只有一个入口 sync_one_click_repay_visible，避免多处设置互相打架。
+        one_click_repay_btn = QPushButton("一键还款")
+        one_click_repay_btn.setMinimumWidth(100)
+
+        def sync_one_click_repay_visible(type_text):
+            """「一键还款」按钮只在「还款」类型下显示（唯一可见性入口）。"""
+            one_click_repay_btn.setVisible(type_text == "还款")
+
+        def on_one_click_repay():
+            """一键还款：强制类型=还款 → 取关联借款 → 回填剩余金额 → 自动点 OK。"""
+            # ★ 硬校验一：类型不是「还款」就先切过来。setCurrentText 是幂等的，
+            #   已经是「还款」时不会触发多余信号；切换会走 update_form 重建借款下拉框。
+            if type_combo.currentText() != "还款":
+                type_combo.setCurrentText("还款")
+            # ★ 硬校验二：切完还不是「还款」就中止，绝不在别的类型下提交。
+            if type_combo.currentText() != "还款":
+                QMessageBox.warning(dialog, "一键还款", "请先把类型选为「还款」。")
+                return
+
+            update_loan_combo()  # 刷新「关联借款」下拉框（还款时本就可见）
+
+            # ★ 优先用用户在「关联借款」里已经选中的那一笔，取不到再回落第 0 笔。
+            #   以前无条件 setCurrentIndex(0)，会把用户特意选中的借款冲掉。
+            #   ★ v7.0：当设置里关掉了「关联借款」下拉框（show_loan_combo=False）时，
+            #   下拉框里没有任何项，currentData() 恒为 None —— 这里直接回落到数据库里
+            #   第一笔未结清借款，否则「一键还款」在那种设置下会直接失效。
+            loan_id = loan_combo.currentData()
+            if loan_id is None and loan_combo.count() > 0:
+                for i in range(loan_combo.count()):
+                    if loan_combo.itemData(i) is not None:
+                        loan_combo.setCurrentIndex(i)
+                        loan_id = loan_combo.itemData(i)
+                        break
+            if loan_id is None:
+                loan_id = self._first_unsettled_loan_id()
+            if loan_id is None:
+                QMessageBox.information(dialog, "一键还款", "没有可关联的借款记录。")
+                return
+
+            # ★ 把这次选中的借款暂存起来：提交时若下拉框被设置隐藏（currentData() 为 None），
+            #   用它兜底，避免「点了按钮却报『没有可关联的借款』」。提交后立刻清掉。
+            self._one_click_loan_id = loan_id
+
+            remaining = self.get_remaining_loan_amount(loan_id)
+            if remaining <= 0:
+                QMessageBox.information(dialog, "一键还款", "该笔借款已还清，无需再还。")
+                return
+            amount_edit.setText(f"{remaining:.2f}")
+            button_box.button(QDialogButtonBox.Ok).click()  # 自动点 OK，走原校验与落库
+
+        one_click_repay_btn.clicked.connect(on_one_click_repay)
+        button_box.addButton(one_click_repay_btn, QDialogButtonBox.ActionRole)
+        # ★ 顺序关键：addButton 会 show() 按钮，所以可见性必须放在它之后再设一次。
+        sync_one_click_repay_visible(type_combo.currentText())
+
+        # 类型切换时同步「一键还款」按钮可见性（仅「还款」时显示）
+        type_combo.currentTextChanged.connect(sync_one_click_repay_visible)
+
         layout.addWidget(button_box)
         
         dialog.setLayout(layout)
-        dialog.exec_()
+
+        # ★ v6.4/v6.5 初始尺寸：宽度 680；高度按“紧凑内容”算（粘贴框 68px 时的高度）
+        # 注意顺序：先临时把粘贴框固定成 68 量出紧凑高度，再恢复为可伸缩，
+        # 否则 QTextEdit 自己的 sizeHint 偏大，弹窗一打开就比内容高。
+        notice_edit.setFixedHeight(68)
+        compact_h = dialog.sizeHint().height()
+        notice_edit.setMinimumHeight(68)
+        notice_edit.setMaximumHeight(16777215)      # QWIDGETSIZE_MAX：解除上限，恢复可伸缩
+        try:
+            avail_h = QApplication.primaryScreen().availableGeometry().height()
+        except Exception:
+            avail_h = 900
+        dialog.resize(680, max(420, min(compact_h, int(avail_h * 0.9))))
+        dialog.exec()
 
     def add_record_from_dialog(self, type_text, amount_text, category, account_id, date, 
                             description, tags, receipt_image_data, is_recurring, 
-                            recurring_freq, recurring_end, loan_id=None):
-        """从弹窗添加记录的核心逻辑"""
+                            recurring_freq, recurring_end, loan_id=None,
+                            rec_time=None):
+        """从弹窗添加记录的核心逻辑
+
+        ★ v7.2/7.3：rec_time 为交易时间 'HH:MM:SS'（如 16:31:06），**关键字传入**。
+          它是最后一个参数而不是插在中间 —— 已有多处按位置传 12 个参数的调用
+          （_scaffold 回归脚本、process_add_record_dialog），插中间会让
+          loan_id 错位到 rec_time 上（v7.1 已被这个坑绊过一次）。
+        """
+        rec_time = rec_time or REC_TIME_DEFAULT
         # 处理待还款合计记录
         if type_text == "待还款合计":
             # 从设置中检查是否允许手动添加合计记录
@@ -5985,22 +7423,23 @@ class FinanceApp(QMainWindow):
                 FROM transactions
                 WHERE date <= ? AND type != 'balance'
             """, (date,))
+            flow_total = self.cursor.fetchone()[0] or 0
             
-            amount = self.cursor.fetchone()[0] or 0
+            # ★ v6.9：总余额快照必须含各账户初始余额，否则「余额统计」永远比
+            #   账户余额少一截（少计），两个数字对不上。
+            self.cursor.execute("SELECT IFNULL(SUM(IFNULL(initial_balance,0)),0) FROM accounts")
+            amount = (self.cursor.fetchone()[0] or 0) + (flow_total or 0)
             
             # 添加余额记录
             self.cursor.execute('''
                 INSERT INTO transactions 
-                (type, amount, category, description, date, account_id)
-                VALUES (?, ?, ?, ?, ?, NULL)
-            ''', ('balance', amount, "余额统计", f"截至 {date} 的总余额", date))
+                (type, amount, category, description, date, account_id, rec_time)
+                VALUES (?, ?, ?, ?, ?, NULL, ?)
+            ''', ('balance', amount, "余额统计", f"截至 {date} 的总余额", date, rec_time))
             self.conn.commit()
             
-            self.statusBar().showMessage(f"✅ 总余额记录已添加: {amount:.2f} 元", 5000)
-            
-            # 清空输入并刷新数据
-            self.load_data()
-            self.update_statistics()
+            # ★ v6.9：走统一刷新出口（含余额快照重算），不再只 load_data
+            self.refresh_after_change(date, f"✅ 总余额记录已添加: {amount:.2f} 元")
             return
         
         # 处理账户结余记录（计算特定账户余额）
@@ -6009,31 +7448,27 @@ class FinanceApp(QMainWindow):
             self.save_state_before_change()
             
             # 计算特定账户的余额
-            self.cursor.execute("""
-                SELECT 
-                    SUM(CASE WHEN type='income' THEN amount ELSE 0 END) -
-                    SUM(CASE WHEN type='expense' THEN amount ELSE 0 END) +
-                    SUM(CASE WHEN type='还款' THEN amount ELSE 0 END) -
-                    SUM(CASE WHEN type='借款' THEN amount ELSE 0 END)
-                FROM transactions
-                WHERE date <= ? AND type != 'balance' AND account_id = ?
+            # ★ v7.5：口径收敛到 self._NET_FLOW_SQL + 有效账户归属，
+            #   以前这里手抄了一份 SUM(CASE...)，且用裸 account_id ——
+            #   用户点「添加账户结余」时算出来的就是 -1016.46（少算的那笔）。
+            self.cursor.execute(f"""
+                SELECT {self._NET_FLOW_SQL}
+                WHERE date <= ? AND type != 'balance' AND {self._eff_account()} = ?
             """, (date, account_id))
             
-            amount = self.cursor.fetchone()[0] or 0
+            # ★ v6.9：账户快照 = 该账户初始余额 + 截至当日流水净额
+            amount = (self.cursor.fetchone()[0] or 0) + (self._get_initial_balance(account_id) or 0)
             
             # 添加账户结余记录
             self.cursor.execute('''
                 INSERT INTO transactions 
-                (type, amount, category, description, date, account_id)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', ('balance', amount, "账户结余统计", f"截至 {date} 的账户结余", date, account_id))
+                (type, amount, category, description, date, account_id, rec_time)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', ('balance', amount, "账户结余统计", f"截至 {date} 的账户结余", date, account_id, rec_time))
             self.conn.commit()
             
-            self.statusBar().showMessage(f"✅ 账户结余记录已添加: {amount:.2f} 元", 5000)
-            
-            # 清空输入并刷新数据
-            self.load_data()
-            self.update_statistics()
+            # ★ v6.9：走统一刷新出口（含余额快照重算），不再只 load_data
+            self.refresh_after_change(date, f"✅ 账户结余记录已添加: {amount:.2f} 元")
             return
         
         # 对于非余额/账户结余记录，验证金额输入
@@ -6069,10 +7504,10 @@ class FinanceApp(QMainWindow):
             self.cursor.execute('''
                 INSERT INTO transactions 
                 (type, amount, category, description, date, status, account_id, tags, 
-                receipt_image, is_recurring, recurring_freq, recurring_end)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                receipt_image, is_recurring, recurring_freq, recurring_end, rec_time)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', ('借款', amount, category, description, date, 'pending', account_id, tags,
-                receipt_image_data, is_recurring, recurring_freq, recurring_end))
+                receipt_image_data, is_recurring, recurring_freq, recurring_end, rec_time))
             self.conn.commit()
             
             self.statusBar().showMessage("✅ 借款记录已添加!", 5000)
@@ -6082,6 +7517,11 @@ class FinanceApp(QMainWindow):
             if not loan_id:
                 self.statusBar().showMessage("❌ 没有可关联的借款!", 5000)
                 return
+            
+            # ★ v6.9（P1-4）：还款必须记到「借款所在账户」，不是表单里当前选中的账户。
+            #   以前用表单 account_id：借款记在 A 账户(-X)，还款却记到了 B（或多计/少计），
+            #   导致 A 永久偏负、B 凭空多出，两本账都错。拿不到才回退表单选择。
+            repay_account_id = self.get_account_id_for_loan(loan_id) or account_id
             
             # 检查还款金额是否超过剩余应还金额
             remaining = self.get_remaining_loan_amount(loan_id)
@@ -6099,20 +7539,20 @@ class FinanceApp(QMainWindow):
                         self.cursor.execute('''
                             INSERT INTO transactions 
                             (type, amount, category, description, date, related_id, account_id, tags, 
-                            receipt_image, is_recurring, recurring_freq, recurring_end)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        ''', ('还款', remaining, category, description, date, loan_id, account_id, tags,
-                            receipt_image_data, 0, None, None))
+                            receipt_image, is_recurring, recurring_freq, recurring_end, rec_time)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ''', ('还款', remaining, category, description, date, loan_id, repay_account_id, tags,
+                            receipt_image_data, 0, None, None, rec_time))
                         
                         # 2. 添加收入记录（超额部分）
                         overpayment = amount - remaining
                         self.cursor.execute('''
                             INSERT INTO transactions 
-                            (type, amount, category, description, date, account_id)
-                            VALUES (?, ?, ?, ?, ?, ?)
+                            (type, amount, category, description, date, account_id, rec_time)
+                            VALUES (?, ?, ?, ?, ?, ?, ?)
                         ''', ('income', overpayment, "退款", 
                             f"借款ID:{loan_id}还款超额退款", 
-                            date, account_id))
+                            date, repay_account_id, rec_time))
                         
                         self.conn.commit()
                         self.statusBar().showMessage(f"✅ 还款记录已添加，超额部分({overpayment:.2f}元)已记录为收入!", 5000)
@@ -6127,33 +7567,25 @@ class FinanceApp(QMainWindow):
                 self.cursor.execute('''
                     INSERT INTO transactions 
                     (type, amount, category, description, date, related_id, account_id, tags, 
-                    receipt_image, is_recurring, recurring_freq, recurring_end)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''', ('还款', amount, category, description, date, loan_id, account_id, tags,
-                    receipt_image_data, 0, None, None))
+                    receipt_image, is_recurring, recurring_freq, recurring_end, rec_time)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', ('还款', amount, category, description, date, loan_id, repay_account_id, tags,
+                    receipt_image_data, 0, None, None, rec_time))
                 
-                # 检查是否还清
+                # ★ v6.9：借款状态一律交给唯一状态机 update_loan_status 推导，
+                #   不再在这里手写 UPDATE status='settled'（它绕过了「还清时把该借款
+                #   名下所有还款记录也置 settled」这一步，账面上会出现半套状态）。
+                self.conn.commit()
+                self.update_loan_status(loan_id)
+                
                 self.cursor.execute('''
-                    SELECT SUM(amount) FROM transactions 
-                    WHERE type='还款' AND related_id=?
+                    SELECT status FROM transactions WHERE id=?
                 ''', (loan_id,))
-                total_repaid = self.cursor.fetchone()[0] or 0
-                
-                self.cursor.execute('''
-                    SELECT amount FROM transactions WHERE id=?
-                ''', (loan_id,))
-                loan_amount = self.cursor.fetchone()[0]
-                
-                if total_repaid >= loan_amount:
-                    # 标记借款为已结算
-                    self.cursor.execute('''
-                        UPDATE transactions SET status='settled' WHERE id=?
-                    ''', (loan_id,))
+                _loan_row = self.cursor.fetchone()
+                if _loan_row and _loan_row[0] == 'settled':
                     self.statusBar().showMessage("✅ 借款已全部还清!", 5000)
                 else:
                     self.statusBar().showMessage("✅ 还款记录已添加!", 5000)
-                
-                self.conn.commit()
         
         else:
             # 普通收入或支出
@@ -6161,26 +7593,20 @@ class FinanceApp(QMainWindow):
             self.cursor.execute('''
                 INSERT INTO transactions 
                 (type, amount, category, description, date, account_id, tags, 
-                receipt_image, is_recurring, recurring_freq, recurring_end)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                receipt_image, is_recurring, recurring_freq, recurring_end, rec_time)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (db_type, amount, category, description, date, account_id, tags,
-                receipt_image_data, is_recurring, recurring_freq, recurring_end))
+                receipt_image_data, is_recurring, recurring_freq, recurring_end, rec_time))
             self.conn.commit()
             
             self.statusBar().showMessage(f"✅ {type_text}记录已添加!", 5000)
         
-        # 更新账户余额和后续日期的余额记录
-        if account_id and account_id != -1:  # 不更新"全部结余"的账户余额
-            self.update_account_balance(account_id)
-        
-        # 更新后续日期的余额记录
-        if type_text in ["收入", "支出", "借款", "还款"]:
-            self.update_future_balances(date)
-        
-        self.update_account_balances()
-        self.load_data()
-        self.update_loan_combo()
-        self.update_statistics()
+        # v6.9（P1-4 / P2-8）：收尾统一走 refresh_after_change。
+        #   以前这里只 update_account_balance(表单账户)：还款记到了借款账户时，
+        #   借款账户的余额根本没重算（漏算）；且 `account_id != -1` 与别处的
+        #   `if account_id` 判断不统一，-1 一路静默空转。现在：
+        #     重算全部账户 + 重算余额快照 + 刷新界面，一次不漏。
+        self.refresh_after_change(date)
 
 
     def update_window_title(self):
@@ -6189,6 +7615,88 @@ class FinanceApp(QMainWindow):
             self.setWindowTitle(f"{ProjectInfo.NAME} {ProjectInfo.VERSION} - 当前用户: {self.current_user}")
         else:
             self.setWindowTitle(f"{ProjectInfo.NAME} {ProjectInfo.VERSION}")
+
+    # ============================================================
+    # ★ v6.8 主库 / launcher 变化即备份
+    #   - finance_master.db 与 launcher.db 不属于「某个用户」的库，
+    #     现有 backup_database 只备当前用户库，覆盖不到这两个文件，
+    #     因此单独做「内容变化即备份」（先比 md5，没变就不备）。
+    #   - finance_master.db 在每次 master_conn.commit() 后自动检查备份；
+    #   - launcher.db 不被本程序改动，靠启动时 + 每小时自动备份时顺带比对。
+    # ============================================================
+    def file_md5(self, path):
+        """计算文件的 md5，文件不存在返回 None。"""
+        if not os.path.isfile(path):
+            return None
+        h = hashlib.md5()
+        with open(path, 'rb') as f:
+            for chunk in iter(lambda: f.read(65536), b''):
+                h.update(chunk)
+        return h.hexdigest()
+
+    def backup_external_db(self, src_path, backup_prefix):
+        """对「主库 / launcher」等程序级文件做变化即备份。
+
+        仅当文件存在且 md5 与最近一份备份不同才复制；
+        复制后清理同前缀旧备份，保留最近 max_backups 份。
+        返回备份文件路径或 None（无变化/失败）。
+        """
+        if not os.path.isfile(src_path):
+            return None
+        cur_md5 = self.file_md5(src_path)
+        if cur_md5 is None:
+            return None
+
+        # 找到同前缀最近一份备份，比对 md5；没变就不备
+        existing = []
+        for fn in os.listdir(self.backup_dir):
+            if fn.startswith(backup_prefix + "_") and fn.endswith(".db"):
+                fp = os.path.join(self.backup_dir, fn)
+                if os.path.isfile(fp):
+                    existing.append((fp, os.path.getmtime(fp)))
+        existing.sort(key=lambda x: x[1], reverse=True)
+        if existing:
+            last_md5 = self.file_md5(existing[0][0])
+            if last_md5 == cur_md5:
+                return None  # 内容没变，跳过
+
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        backup_name = f"{self.backup_dir}/{backup_prefix}_{timestamp}.db"
+        try:
+            shutil.copy2(src_path, backup_name)
+        except Exception as e:
+            print(f"备份 {backup_prefix} 失败: {str(e)}")
+            return None
+
+        # 清理旧的，保留最近 max_backups 份
+        existing.append((backup_name, os.path.getmtime(backup_name)))
+        existing.sort(key=lambda x: x[1], reverse=True)
+        while len(existing) > self.max_backups:
+            old = existing.pop()
+            try:
+                os.remove(old[0])
+            except Exception as e:
+                print(f"删除旧备份失败: {str(e)}")
+        return backup_name
+
+    def commit_master(self):
+        """提交主库并在内容变化时自动备份 finance_master.db。"""
+        try:
+            self.master_conn.commit()
+        except Exception as e:
+            print(f"master commit 失败: {str(e)}")
+        # 变化即备份（md5 去重，无变化不备）
+        backed = self.backup_external_db('finance_master.db', 'master')
+        if backed:
+            print(f"主库变化备份: {backed}")
+
+    def auto_backup_external(self):
+        """每小时自动备份时，顺带对主库与 launcher 做变化即备份。"""
+        for src, prefix in (('finance_master.db', 'master'),
+                           ('Finance_App/launcher.db', 'launcher')):
+            backed = self.backup_external_db(src, prefix)
+            if backed:
+                print(f"{prefix} 变化备份: {backed}")
 
     def backup_database(self, backup_type="auto"):
         """执行数据库备份"""
@@ -6200,7 +7708,9 @@ class FinanceApp(QMainWindow):
                 # 对于加密数据库，导出内存数据库
                 with open(backup_name, 'wb') as f:
                     # 获取所有数据
-                    temp_conn = sqlite3.connect(':memory:')
+                    # ★ v6.9 P0-3：以前这里新建一个空的内存库来读 schema，导出结果恒为空
+                    #   （撤销会清库、加密备份是空壳）。改为直接从当前连接导出。
+                    temp_conn = self.conn
                     temp_cursor = temp_conn.cursor()
                     
                     # 获取所有数据
@@ -6221,7 +7731,7 @@ class FinanceApp(QMainWindow):
                             values = ", ".join([f"'{str(v)}'" if v is not None else "NULL" for v in row])
                             data_dump.append(f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({values});")
                     
-                    temp_conn.close()
+                    # 注意：temp_conn 就是 self.conn，绝不能 close
                     
                     # 合并模式和数据进行加密
                     full_dump = schema + "\n" + "\n".join(data_dump)
@@ -6367,7 +7877,7 @@ class FinanceApp(QMainWindow):
         
         dialog.setLayout(layout)
         
-        if dialog.exec_() == QDialog.Accepted:
+        if dialog.exec() == QDialog.Accepted:
             self.max_backups = backup_count_spin.value()
             
             # 设置备份间隔
@@ -6396,6 +7906,24 @@ class FinanceApp(QMainWindow):
         # 计算剩余金额
         remaining = loan_amount - repaid_amount
         return max(0, remaining)  # 确保不为负数
+
+    def _first_unsettled_loan_id(self):
+        """返回第一笔「还没还清」的借款 id，没有则返回 None。
+
+        ★ v7.0 新增：设置里可以关掉「关联借款」下拉框（show_loan_combo=False），
+        那种情况下下拉框里一项都没有，currentData() 恒为 None。若「一键还款」只从
+        下拉框取借款，就会被判定成「没有可关联的借款」而直接失效。这里直接查库兜底，
+        保证无论界面怎么配置，一键还款都能找到要还的那一笔。
+        """
+        try:
+            self.cursor.execute(
+                "SELECT id FROM transactions WHERE type='借款' AND status='pending' ORDER BY date, id LIMIT 1"
+            )
+            row = self.cursor.fetchone()
+            return row[0] if row else None
+        except Exception as e:
+            print(f"[_first_unsettled_loan_id] 查询失败: {e}")
+            return None
 
     def adjust_overpayment(self, repayment_id):
         """调整超额还款"""
@@ -6443,14 +7971,20 @@ class FinanceApp(QMainWindow):
             # 2. 创建一条新的收入记录来处理超额部分
             self.cursor.execute('''
                 INSERT INTO transactions 
-                (type, amount, category, description, date, account_id)
-                VALUES (?, ?, ?, ?, ?, ?)
+                (type, amount, category, description, date, account_id, rec_time)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
             ''', ('income', overpayment, "退款", 
                 f"借款ID:{loan_id}还款超额退款", 
                 QDate.currentDate().toString("yyyy-MM-dd"),
-                self.get_account_id_for_loan(loan_id)))
+                self.get_account_id_for_loan(loan_id), rec_time_now()))
             
             self.conn.commit()
+
+            # ★ v6.9（P2-1）：这里以前 commit 完直接 return，改了还款金额、
+            #   又插了一条收入，却一次余额都没重算 → 账户结余停在旧值（漏算）。
+            self.refresh_after_change(
+                QDate.currentDate().toString("yyyy-MM-dd"),
+                "✅ 超额还款已调整!")
             return True
         except Exception as e:
             self.conn.rollback()
@@ -6482,11 +8016,13 @@ class FinanceApp(QMainWindow):
     def process_add_record_dialog(self, dialog, type_combo, amount_edit, category_combo, 
                                 account_combo, date_edit, desc_edit, tags_edit, 
                                 receipt_image_data, recurring_check, recurring_freq_combo, 
-                                recurring_end_edit, loan_combo):
+                                recurring_end_edit, loan_combo, time_edit=None):
         """处理添加记录对话框的提交"""
         type_text = type_combo.currentText()
         
         if type_text == "待还款合计":
+            # ★ v6.9（P2-6）：补撤销点，和 add_record 里的同名分支保持一致。
+            self.save_state_before_change()
             self.cursor.execute("""
                 SELECT SUM(t1.amount - IFNULL(t2.repaid, 0)) 
                 FROM transactions t1
@@ -6502,19 +8038,31 @@ class FinanceApp(QMainWindow):
             
             self.cursor.execute('''
                 INSERT INTO transactions 
-                (type, amount, category, description, date)
-                VALUES (?, ?, ?, ?, ?)
+                (type, amount, category, description, date, rec_time)
+                VALUES (?, ?, ?, ?, ?, ?)
             ''', ('待还款合计', total_remaining, "借款统计", 
                 f"截至 {date_edit.date().toString('yyyy-MM-dd')} 的待还款合计",
-                date_edit.date().toString("yyyy-MM-dd")))
+                date_edit.date().toString("yyyy-MM-dd"),
+                rec_time_from_qtime(time_edit.time() if time_edit is not None else None)))
             
             self.conn.commit()
             dialog.accept()
-            self.statusBar().showMessage(f"✅ 待还款合计记录已添加: {total_remaining:.2f} 元", 5000)
-            self.load_data()
+            # ★ v7.4：与主窗口 add_record 的同名分支保持一致 —— 统一走 refresh_after_change
+            self.refresh_after_change(
+                date_edit.date().toString("yyyy-MM-dd"),
+                f"✅ 待还款合计记录已添加: {total_remaining:.2f} 元")
             self._scroll_table_to_bottom()      # ★ v4.9 添加后滚到底（设置开启时）
         else:
             dialog.accept()
+            # ★ v7.0：还款的关联借款优先取下拉框当前选择；下拉框被设置隐藏时，
+            #   回落到「一键还款」刚暂存的那一笔（仅一键还款路径会写这个暂存值，
+            #   手工添加时它恒为 None，不会出现「看不见却被隐式关联第一笔」的问题）。
+            _loan_id_for_submit = None
+            if type_text == "还款":
+                _loan_id_for_submit = loan_combo.currentData()
+                if _loan_id_for_submit is None:
+                    _loan_id_for_submit = getattr(self, "_one_click_loan_id", None)
+                self._one_click_loan_id = None
             self.add_record_from_dialog(
                 type_text, amount_edit.text(), category_combo.currentText(),
                 account_combo.currentData(), date_edit.date().toString("yyyy-MM-dd"),
@@ -6522,45 +8070,114 @@ class FinanceApp(QMainWindow):
                 recurring_check.isChecked(), 
                 recurring_freq_combo.currentText() if recurring_check.isChecked() else None,
                 recurring_end_edit.date().toString("yyyy-MM-dd") if recurring_check.isChecked() else None,
-                loan_combo.currentData() if type_text == "还款" else None
+                _loan_id_for_submit,
+                # ★ v7.2 交易时间必须**关键字**传，位置传会落到 loan_id 上
+                rec_time=rec_time_from_qtime(
+                    time_edit.time() if time_edit is not None else None)
             )
             self._scroll_table_to_bottom()      # ★ v4.9 添加后滚到底（设置开启时）
 
-    def save_last_type(self, type_text):
-        """保存最后选择的类型"""
-        self.last_selections['type'] = type_text
-        # 保存到数据库设置
-        self.cursor.execute(
-            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
-            ('last_type', type_text)
-        )
-        self.conn.commit()
-
-    def save_last_account(self, index):
-        """保存最后选择的账户"""
-        # 获取当前显示的文本和关联的数据
-        account_text = self.sender().currentText()
-        account_data = self.sender().currentData()
-        
-        # 只保存有效的账户选择（排除"全部结余"选项）
-        if account_data != -1:
-            self.last_selections['account'] = (account_text, account_data)
-            # 保存到数据库设置
+    # ============================================================
+    # ★ v7.1 「类型 / 账户 / 类别」跨重启持久化
+    #   两个关键设计：
+    #   1) 三个 save_last_* 一律先看 self._settings_restoring：界面重建 / 恢复设置
+    #      期间控件会先落到默认值（账户下拉框从「全部结余」切到第一个账户），
+    #      此时若回写就把上次保存的值用默认值盖掉 —— 这正是原来「账户记不住」
+    #      的根因（create_input_form 比 load_settings 先跑）。
+    #   2) 账户同时存 文本 + id（last_account_id）。只存文本时账户一改名，
+    #      下次 findText() 找不到就静默退回第一个账户；按 id 恢复才稳。
+    # ============================================================
+    def _settings_write(self, key, value):
+        """写一个 last_* 设置键（实时落盘，★ v7.1 统一入口）"""
+        try:
             self.cursor.execute(
                 "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
-                ('last_account', account_text)
+                (key, str(value))
             )
             self.conn.commit()
+        except Exception as e:
+            print(f"[save_last] 写设置 {key} 失败: {e}")
+
+    def save_last_type(self, type_text):
+        """保存最后选择的类型"""
+        if self._settings_restoring:
+            return
+        self.last_selections['type'] = type_text
+        self._settings_write('last_type', type_text)
+
+    def save_last_account(self, index=None, combo=None):
+        """保存最后选择的账户（★ v7.1 同时存名称与 id，账户改名也能恢复）
+
+        combo 显式传入：主窗口与「添加记录」弹窗各有一个账户下拉框，
+        以前靠 self.sender() 取，任何非信号直连的调用都会拿到 None 并抛
+        AttributeError；现在默认回落 sender()，兼容旧调用点。
+        """
+        if self._settings_restoring:
+            return
+        if combo is None:
+            combo = self.sender()
+        if combo is None:
+            return
+        account_text = combo.currentText()
+        account_data = combo.currentData()
+
+        # 只保存有效的账户选择（排除「全部结余」选项）
+        if account_data is None or account_data == -1:
+            return
+        self.last_selections['account'] = (account_text, account_data)
+        self._settings_write('last_account', account_text)
+        self._settings_write('last_account_id', account_data)
 
     def save_last_category(self, category_text):
         """保存最后选择的类别"""
+        if self._settings_restoring:
+            return
         self.last_selections['category'] = category_text
-        # 保存到数据库设置
-        self.cursor.execute(
-            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
-            ('last_category', category_text)
-        )
-        self.conn.commit()
+        self._settings_write('last_category', category_text)
+
+    def restore_account_selection(self, combo, stored=None):
+        """把持久化的账户选择恢复到 combo 上（★ v7.1 主窗口 / 弹窗共用）
+
+        恢复优先级：last_account_id（改名免疫）→ last_account 文本 → 第一个真实账户。
+        stored 可传入内存里的 (text, id)，为 None 时读 settings 表。
+        返回最终选中的账户 id（没有可用账户时返回 None）。
+        """
+        acc_id = None
+        acc_text = None
+        if stored:
+            acc_text, acc_id = stored
+        # 内存里没有就独立读库兜底（弹窗打开时 last_selections 可能还没同步）
+        if acc_id is None:
+            try:
+                self.cursor.execute("SELECT value FROM settings WHERE key='last_account_id'")
+                row = self.cursor.fetchone()
+                if row and row[0] not in (None, ''):
+                    acc_id = int(float(row[0]))
+            except (sqlite3.Error, ValueError, TypeError):
+                acc_id = None
+        if not acc_text:
+            try:
+                self.cursor.execute("SELECT value FROM settings WHERE key='last_account'")
+                row = self.cursor.fetchone()
+                if row and row[0]:
+                    acc_text = row[0]
+            except sqlite3.Error:
+                acc_text = None
+
+        index = -1
+        if self._valid_account_id(acc_id):
+            index = combo.findData(acc_id)
+            if index < 0 and acc_id != -1:
+                # 账户已被删除（id 找不到）→ 再看名字，名字也找不到就交给下面的兜底
+                index = -1
+        if index < 0 and acc_text:
+            index = combo.findText(acc_text)
+        if index < 0 and combo.count() > 1:
+            index = 1  # 兜底：第一个真实账户（索引 0 是「全部结余」）
+        if index >= 0:
+            combo.setCurrentIndex(index)
+            return combo.currentData()
+        return None
 
 
 
@@ -6581,4 +8198,4 @@ if __name__ == "__main__":
     
     window = FinanceApp()
     window.show()
-    sys.exit(app.exec_())
+    sys.exit(app.exec())

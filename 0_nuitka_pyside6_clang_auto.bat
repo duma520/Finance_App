@@ -3,8 +3,8 @@ chcp 65001 >nul
 rem ============================================================
 rem  人民币收支管理系统 - Nuitka 编译脚本（唯一编译入口）
 rem  唯一编译源: Finance_App.py（不要用 version\ 里的历史副本）
-rem  本项目是 PyQt5，插件必须用 --enable-plugin=pyqt5
-rem  （脚本名沿用模板名 0_nuitka_pyside6_clang_auto.bat，勿照抄 pyside6）
+rem  本项目是 PySide6（★ v6.0 从 PyQt5 迁移过来），插件必须用 --enable-plugin=pyside6
+rem  （Qt5 时代的 --enable-plugin=pyqt5 已经不再适用：项目里已经没有任何 PyQt5 导入）
 rem
 rem  ★ 强制约定（见 软件升级迭代记录.md 第十一节）：
 rem    主程序改动只要影响打包，必须同步改本脚本：
@@ -23,7 +23,7 @@ rmdir /s /q *.build
 rmdir /s /q *.dist
 
 nuitka --standalone ^
-    --enable-plugin=pyqt5 ^
+    --enable-plugin=pyside6 ^
     --windows-console-mode=disable ^
     --jobs=4 ^
     --remove-output ^

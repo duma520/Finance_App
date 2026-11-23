@@ -805,7 +805,7 @@ SQLite 只认到秒。把 `2026-11-21 16:31:06` 塞进日期列，它当**非法
 **老数据体检 / 补时间**：
 
 ```bash
-cd /d G:\Python_Code\Finance_App
+cd /d 你的项目目录\Finance_App
 python _scaffold\audit_rec_time.py            # 只读演练，看哪些库要补
 python _scaffold\audit_rec_time.py --apply    # 真写（写前自动把整库备份到 backups\）
 ```
@@ -1599,7 +1599,7 @@ A：有。`_scaffold\` 下六套冒烟测试（均为真实构造 `FinanceApp`�
 合计 **580 项**（459 + v7.1 的 14 条 + v7.2/7.3 的 19 条 + v7.4 的 33 条 + v7.5 的 27 条 + v7.6 的 30 条）。跑法：
 
 ```bash
-cd /d G:\Python_Code\Finance_App
+cd /d 你的项目目录\Finance_App
 python _scaffold\smoke_test_balance_v69.py
 python _scaffold\smoke_test_app_boot.py
 python _scaffold\_probe_rec_time_v72.py
@@ -1693,8 +1693,8 @@ Nuitka 在**编译开始时**读源码，编译要几分钟。如果编译启动
 直接用项目自带的验证脚本：
 
 ```powershell
-Push-Location "G:\Python_Code\Finance_App"
-& "D:/Program Files/Python310/python.exe" -u _scaffold/verify_exe.py
+Push-Location "你的项目目录\Finance_App"
+& python -u _scaffold/verify_exe.py
 Pop-Location
 ```
 
@@ -1953,7 +1953,7 @@ python -m nuitka --standalone --enable-plugin=pyside6 --windows-console-mode=dis
 跑：
 
 ```bash
-cd /d G:\Python_Code\Finance_App
+cd /d 你的项目目录\Finance_App
 python _scaffold\verify_exe.py
 ```
 
